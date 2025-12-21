@@ -2,7 +2,7 @@ Serverless Airflow on Modal
 
 ## Overview
 
-A CLI tool airflow-serverless that deploys a minimal, serverless Airflow environment on Modal. Tasks execute as direct Modal Function calls (truly serverless, pay-per-use), with SQLite-on-Volume or PostgreSQL for metadata storage.
+A CLI tool `modalflow` that deploys a minimal, serverless Airflow environment on Modal. Tasks execute as direct Modal Function calls (truly serverless, pay-per-use), with PostgreSQL for metadata storage.
 
 ## Architecture
 ```
@@ -18,14 +18,18 @@ A CLI tool airflow-serverless that deploys a minimal, serverless Airflow environ
 │   ┌──────────────────────────────────────────────────────────┐      │  
 │   │ Modal Volume                                             │      │  
 │   │  /dags/   - DAG Python files                             │      │  
-│   │  /data/   - SQLite DB (airflow.db)                       │      │  
+│   │  /logs/   - Task logs (text files)                       │      │  
 │   │  /xcom/   - XCom payloads (JSON/Pickle)                  │      │  
 │   │  /venvs/  - Cached virtual environments                  │      │  
 │   └──────────────────────────────────────────────────────────┘      │  
 │          │                                                          │  
 │   ┌─────────────┐ (on-demand via CLI)                               │  
-│   │  Ephemeral  │◀─── airflow-serverless ui --env dev               │  
+│   │  Ephemeral  │◀─── modalflow ui --env dev                    │  
 │   │  UI Server  │                                                   │  
+│   └─────────────┘                                                   │  
+│          │                                                          │  
+│   ┌─────────────┐                                                   │  
+│   │ PostgreSQL  │ (External or Modal-hosted)                        │  
 │   └─────────────┘                                                   │  
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -33,116 +37,117 @@ A CLI tool airflow-serverless that deploys a minimal, serverless Airflow environ
 ## Package Structure
 
 ```
-airflow-serverless/  
+modalflow/  
 ├── pyproject.toml  
 ├── README.md  
 ├── src/  
 │ └── airflow_serverless/  
-│ ├── **init**.py  
+│ ├── __init__.py  
 │ ├── cli.py # Click CLI entry point  
 │ ├── config.py # YAML config parser  
-│ ├── modal_app.py # Modal App factory  
+│ ├── modal_app.py # Modal App factory (uses apache/airflow image)
 │ ├── db/  
-│ │ ├── **init**.py  
-│ │ ├── backend.py # Abstract DB interface  
-│ │ ├── sqlite_backend.py # SQLite on Volume  
-│ │ └── postgres_backend.py # PostgreSQL support  
+│ │ ├── __init__.py  
+│ │ └── postgres_backend.py # PostgreSQL support (ONLY supported backend)
 │ ├── scheduler/  
-│ │ ├── **init**.py  
-│ │ └── scheduler.py # Serverless scheduler  
+│ │ ├── __init__.py  
+│ │ └── scheduler.py # Serverless scheduler with strict parsing timeouts
 │ ├── executor/  
-│ │ ├── **init**.py  
-│ │ └── modal_executor.py # Custom Modal executor  
+│ │ ├── __init__.py  
+│ │ └── modal_executor.py # Custom Modal executor (BaseExecutor)
 │ ├── dags/  
-│ │ ├── **init**.py  
+│ │ ├── __init__.py  
 │ │ └── storage.py # DAG upload/management  
 │ └── ui/  
-│ ├── **init**.py  
-│ └── server.py # Ephemeral UI server  
+│ ├── __init__.py  
+│ └── server.py # Ephemeral UI server
 └── tests/
 ```
 
 ## CLI Commands
 
-airflow-serverless create --env {name} --config config.yaml
+`modalflow create --env {name} --config config.yaml`
 	What it does:
-	1. Parses config.yaml for database type and settings
-	2. Creates Modal App named airflow-serverless-{env}
-	3. Creates Modal Volume airflow-dags-{env}
+	1. Parses config.yaml for database settings
+	2. Creates Modal App named modalflow-{env}
+	3. Creates Modal Volume airflow-vol-{env}
 	4. Creates Modal Dict airflow-state-{env} for scheduler/executor coordination
 	5. Stores secrets (db connection string) in Modal Secrets
-	6. Deploys the scheduler function with cron schedul
+	6. Deploys the scheduler function with cron schedule
 	7. Initializes database schema (creates tables)
 
-config.yaml structure:  
+`config.yaml` structure:  
 ```yaml
 database:  
-	type: sqlite # or 'postgres'
-
-# If postgres:
-
-connection_string: "postgresql://user:pass@host:5432/db"
+	connection_string: "postgresql://user:pass@host:5432/db"
 
 scheduler:  
 	interval_seconds: 60 # How often scheduler runs
+	parse_timeout_seconds: 5 # Timeout per DAG file parsing
 
 executor:  
 	parallelism: 16 # Max concurrent tasks  
 	task_timeout: 3600 # Default task timeout in seconds
 ```
 
-`airflow-serverless dags create --env {name} --file dag.py`
+`modalflow dags create --env {name} --file dag.py`
 	What it does:
 	1. Validates DAG file by attempting to parse it locally
 	2. Uploads DAG file to Modal Volume at /dags/{filename}
 	3. Triggers volume commit
 
-`airflow-serverless dags list --env {name}`
+`modalflow dags list --env {name}`
 	What it does:
 	1. Lists all .py files in the /dags/ directory on Modal Volume
 	2. Optionally shows which DAGs have been detected by the scheduler
 
-`airflow-serverless dags update --env {name} --file dag.py`
+`modalflow dags update --env {name} --file dag.py`
 	What it does:
 	1. Validates DAG file locally
 	2. Overwrites existing file on Modal Volume
 	3. Next scheduler run will pick up changes
 
-`airflow-serverless dags delete --env {name} --dag-id {dag_id}`
+`modalflow dags delete --env {name} --dag-id {dag_id}`
 	What it does:
 	1. Removes DAG file from Volume
 	2. Marks DAG as inactive in database
 
-`airflow-serverless ui --env {name}`
+`modalflow ui --env {name}`
 	What it does:
 	1. Spawns an ephemeral Modal Function running the Airflow FastAPI UI
-	2. Connects to the environment's database
+	2. Connects to the environment's database and /vol/logs/
 	3. Opens browser or prints URL
 	4. Keeps running until Ctrl-C is pressed
-	5. On Ctrl-C: terminates the Modal function
 
 ## Core Components
 
 ### Scheduler (`scheduler/scheduler.py`)
 
-A Modal Function that runs on a cron schedule (default: every 60 seconds):
+A Modal Function that runs on a cron schedule (default: every 60 seconds).
+To prevent overruns, the scheduler strictly limits time spent parsing DAGs.
 
 ```python
 @app.function(
+	image=airflow_image,
 	schedule=modal.Period(seconds=60),
 	volumes={"/vol": volume},
 	secrets=[modal.Secret.from_name(f"airflow-secrets-{env}")],
-	timeout=300,
+	timeout=300, # Hard timeout for the function
 )
 def scheduler_tick():  
 	"""Single scheduler iteration."""
-	# 1. Acquire scheduler lock
+	# 1. Acquire scheduler lock (via DB advisory lock)
 	
 	# 2. Initialize Executor
 	# executor = ModalExecutor()
 	# executor.start()
 	
-	# 3. Load DAGs & Sync Metadata
+	# 3. Load DAGs & Sync Metadata (Inline Parsing)
+	# - Iterate over /vol/dags/*.py
+	# - For each file: 
+	#     Fork/Process with 5s timeout. 
+	#     If timeout -> Mark Import Error. 
+	#     Else -> Update DB.
 	
 	# 4. Create DagRuns
 	
@@ -157,15 +162,10 @@ def scheduler_tick():
 	# executor.end()
 ```
 
-Key simplifications vs full Airflow:
-- No persistent process (runs every N seconds)
-- No DagFileProcessor subprocess (inline DAG parsing)
-- No callbacks/sensors/triggerers
-- No pools/variables/connections management
-
 ### Modal Executor (executor/modal_executor.py)
 
-A custom Airflow Executor that allows both "serverless" usage (inside our scheduler) and "remote" usage (connecting an existing Airflow cluster to Modal).
+A custom Airflow Executor inheriting from `BaseExecutor` (Airflow 2.x style).
+Allows "serverless" usage and standard Airflow compatibility.
 
 ```python
 from airflow.executors.base_executor import BaseExecutor
@@ -182,250 +182,113 @@ class ModalExecutor(BaseExecutor):
 	def sync(self):
 		"""Poll Modal for task status."""
 		# 1. Check Modal Dict or result futures
-		# 2. Update self.event_buffer with SUCCESS/FAILED events
-		# 3. Handle Zombies
+		# 2. Reconcile with DB: DB is source of truth.
+		#    If DB says QUEUED but Dict has no record -> Re-queue (at-least-once).
+		# 3. Update self.event_buffer with SUCCESS/FAILED events
+		# 4. Handle Zombies (if task missing from Dict for > N minutes)
 		
-@app.function(...)
+@app.function(image=airflow_image, ...)
 def execute_task(task_info: dict):
 	"""Execute a single Airflow task (Worker)."""
-	# ... (same logic as before: requirements, dag load, execute, status update)
-```
-
-State coordination via Modal Dict:
-
-Scheduler writes:
-
-```python
-state_dict[f"task:{dag_id}:{task_id}:{run_id}"] = {  
-	"status": "QUEUED",  
-	"call_id": modal_call.object_id,  
-	"queued_at": timestamp  
-}
-```
-
-Task updates on completion:
-```python
-state_dict[f"task:{dag_id}:{task_id}:{run_id}"] = {  
-	"status": "SUCCESS", # or "FAILED"  
-	"completed_at": timestamp  
-}
+	# 1. Configure logging to write to /vol/logs/{dag_id}/{task_id}/...
+	# 2. Load DAG
+	# 3. Execute Task
+	# 4. Update status in Modal Dict (hot cache)
 ```
 
 ### Database Layer (db/)
 
-Abstract interface:  
-```python
-class DatabaseBackend(ABC):  
-	@abstractmethod  
-	def get_connection(self): ...
-	
-	@abstractmethod
-	def acquire_lock(self, lock_name: str, timeout: int) -> bool: ...
-	
-	@abstractmethod
-	def release_lock(self, lock_name: str): ...
-```
+**PostgreSQL ONLY.**
+- Dropped SQLite support due to locking issues on network volumes.
+- Uses `pg_try_advisory_lock()` for scheduler coordination.
+- Connection string provided via secrets.
 
-#### SQLite Backend:
-- Uses WAL mode for better concurrency
-- File stored at /vol/data/airflow.db on Modal Volume
-- ==Distributed lock via Modal Dict (scheduler lock)==
-- Read-only operations from UI (no manual task triggers)
+### Logging
+- Tasks write standard Airflow logs to `/vol/logs/`.
+- `FileTaskHandler` configured to read/write from this volume path.
+- UI server mounts `/vol/` to serve logs to the user.
 
-#### PostgreSQL Backend:
-- Uses pg_try_advisory_lock() for distributed locking
-- Full read-write support
-- Better for production workloads
+### Base Image
+- Uses `apache/airflow:2.10.0-python3.10` (or similar) as the base.
+- Reduces implementation overhead and ensures environment compatibility.
 
 ### XCom Backend (xcom/backend.py)
-To resolve concurrency issues with SQLite and enable inter-task communication:
-
 - **Custom Backend:** `VolumeXComBackend`
-- **Storage:** Payloads stored as files in `/vol/xcom/{dag_id}/{run_id}/{task_id}/{key}` (JSON or Pickle).
-- **Behavior:**
-  - `xcom_push`: Writes file to Volume.
-  - `xcom_pull`: Reads file from Volume.
-- **Benefit:** Keeps large payloads out of SQLite, reducing lock contention.
-
-### DAG Storage (dags/storage.py)
-
-```python
-class DagStorage:  
-	def __init__(self, volume: modal.Volume, dags_path: str = "/vol/dags"):  
-	self.volume = volume  
-	self.dags_path = dags_path
-	def upload(self, local_path: str, dag_filename: str):
-		 """Upload a DAG file to the volume."""
-		 # Uses Modal's volume.put_file() or a Modal function
-	
-	def list_dags(self) -> list[str]:
-		 """List all DAG files in the volume."""
-	
-	def delete(self, dag_filename: str):
-		 """Remove a DAG file from the volume."""
-```
-
-### Ephemeral UI (ui/server.py)
-
-```python
-@app.function(  
-	volumes={"/vol": volume},  
-	secrets=[modal.Secret.from_name(f"airflow-secrets-{env}")],  
-)  
-@modal.asgi_app()  
-def serve_ui():  
-	"""Serve the Airflow UI."""  
-	from airflow.api_fastapi.app import create_app
-	
-	# Configure minimal Airflow settings
-	
-	# Return FastAPI app
-	
-# CLI implementation for ephemeral UI:  
-def ui_command(env: str):
-	
-	# 1. Create a temporary Modal App with the UI function
-	
-	# 2. Deploy with modal.serve() (blocking)
-	
-	# 3. Print the URL
-	
-	# 4. On Ctrl-C: stop the server
-```
+- **Storage:** Payloads stored as files in `/vol/xcom/{dag_id}/{run_id}/{task_id}/{key}`.
+- **Benefit:** Keeps large payloads out of Postgres.
 
 ## Data Flow
 
 ### DAG Upload Flow
-
-```
-User: airflow-serverless dags create --file my_dag.py  
-│  
-▼  
-CLI validates DAG locally (import check)  
-│  
-▼  
-CLI uploads to Modal Volume /vol/dags/my_dag.py  
-│  
-▼  
-Next scheduler_tick() parses DAG, writes to DB  
-│  
-▼  
-DAG appears in UI
-```
+(Unchanged)
+CLI -> Validate Locally -> Upload to Volume -> Scheduler picks up -> DB Update
 
 ### Task Execution Flow
-
 ```
-scheduler_tick() (Modal Function)
+scheduler_tick()
 │
 ├─▶ 1. Instantiate ModalExecutor()
 │
-├─▶ 2. Parse DAGs & Create DagRuns
+├─▶ 2. Parse DAGs (Strict Timeout per File)
 │
-├─▶ 3. Find Ready Tasks
-│
-└─▶ 4. executor.heartbeat()
+├─▶ 3. Schedule & Heartbeat
     │
-    ├─▶ Sync: Poll Modal Dict for completed tasks
+    ├─▶ Sync: 
+    │   - Poll Modal Dict
+    │   - Reconcile with Postgres (DB is Truth)
     │
-    └─▶ Execute: For each new task:
+    └─▶ Execute: 
         │
-        └─▶ execute_task.spawn() (Remote Worker)
+        └─▶ execute_task.spawn()
             │
-            ├─▶ Prepare Env & Load DAG
+            ├─▶ Mount Volume (Logs/XCom)
+            │
+            ├─▶ Write Logs to /vol/logs/...
             │
             └─▶ task.execute() -> Write Result to Dict
 ```
 
-## Database Schema (Minimal)
-
-Only the essential tables for core functionality:
-```sql
--- DAG metadata  
-dag (dag_id, is_active, schedule_interval, ...)  
-serialized_dag (dag_id, data, ...)
-
--- Execution tracking  
-dag_run (run_id, dag_id, state, execution_date, ...)  
-task_instance (task_id, dag_id, run_id, state, try_number, ...)
-
--- Import errors for debugging  
-import_error (filename, timestamp, stacktrace)
-```
-
-Not included (minimal scope):
-- variable, connection, pool - no advanced features
-- xcom - no inter-task communication
-- trigger, callback - no async features
-- log - logs go to Modal's logging
-
 ## Key Technical Decisions
 
-1. Custom BaseExecutor Implementation: `ModalExecutor` inherits from `BaseExecutor`.
-	- Reasons:
-		1. Allows existing external Airflow clusters to offload to Modal.
-		2. Reuses Airflow's robust state management and event buffering.
-		3. "Serverless" scheduler simply instantiates this executor class.
-2. SQLite Concurrency
-	1. Only scheduler writes to DB (single writer)
-	2. Tasks update their own status (minimal contention)
-	3. XCom payloads offloaded to Volume files to avoid DB locks
-	4. Modal Dict for cross-function coordination
-	5. WAL mode + busy_timeout for resilience
-3. Ephemeral UI
-	1. Not always deployed (saves costs)
-	2. User runs airflow-serverless ui when needed
-	3. Uses modal serve for local development experience
-	4. Ctrl-C cleanly terminates
-4. No Airflow Providers
-	1. Only core operators (PythonOperator, BashOperator)
-	2. Users can install providers in their DAG files if needed
-	3. Keeps the base image small
+1. **BaseExecutor on Airflow 2.x**: Ensures compatibility with existing DAGs and allows hybrid deployments.
+2. **Postgres Only**: Hard requirement for stability. No SQLite.
+3. **Cron Scheduler**: "Ticking" function every 60s. Low cost, "scale-to-zero".
+4. **Strict Parsing Timeouts**: Prevents scheduler overruns. Bad DAGs fail fast; good DAGs run.
+5. **Logs on Volume**: Simple, native file-based logging accessible by UI.
+6. **Airflow Base Image**: Leverages upstream maintenance.
 
 ## Implementation Plan
 
-### Phase 1: Core Infrastructure
-1. Set up new repo with pyproject.toml
-2. Implement CLI skeleton with Click
-3. Implement config.yaml parsing
-4. Create Modal App factory function
+### Phase 1: Core & Executor
+1. Set up repo with `pyproject.toml`.
+2. Define `modal_app.py` using `apache/airflow` base image.
+3. Implement `ModalExecutor` (extending `BaseExecutor`).
+4. Implement `execute_task` Modal function.
+5. Test: Run `ModalExecutor` against standard Airflow tests (mocked).
 
-### Phase 2: Database Layer
-1. Implement SQLite backend with Volume storage
-2. Implement PostgreSQL backend
-3. Implement VolumeXComBackend (storage logic)
-4. Create schema initialization (subset of Airflow tables)
-5. Test backends and XCom storage
+### Phase 2: Database & State
+1. Implement `PostgresBackend` connection and locking.
+2. Implement schema initialization (subset of Airflow tables).
+3. Implement `VolumeXComBackend`.
 
-### Phase 3: DAG Management
-1. Implement DAG upload to Volume
-2. Implement DAG listing
-3. Implement DAG deletion
-4. Test DAG parsing with DagBag
+### Phase 3: Scheduler
+1. Implement `scheduler_tick()` skeleton.
+2. Implement **Robust DAG Parsing** with timeouts (`multiprocessing` or `func_timeout`).
+3. Implement scheduling loop.
 
-### Phase 4: Scheduler
-1. Implement scheduler_tick() function
-2. Implement DAG parsing and sync
-3. Implement DagRun creation logic
-4. Implement task readiness checking
-5. Implement task spawning via Modal
+### Phase 4: DAG Management & CLI
+1. Implement CLI for `create`, `dags upload/list`.
+2. Implement Volume-based DAG storage.
 
-### Phase 5: Task Execution
-1. Implement execute_task() function
-2. Implement dynamic requirements installation (Volume-backed venvs)
-3. Implement status updates to DB and Dict
-4. Test end-to-end task execution
-5. Test task failures, retries, and sensors (reschedule)
+### Phase 5: UI & Logs
+1. Configure `FileTaskHandler` for `/vol/logs`.
+2. Implement ephemeral UI server (mounting volume).
+3. Verify log visibility in UI.
 
-### Phase 6: UI
-1. Implement ephemeral UI server
-2. Implement CLI ui command with modal serve
-3. Test UI with both database backends
-
-### Phase 7: Testing & Polish
-1. Integration tests
-2. Documentation
-3. Example DAGs
+### Phase 6: Integration & Polish
+1. E2E tests on Modal.
+2. Documentation.
+3. Example DAGs.
 
 ## Dependencies
 
@@ -433,17 +296,16 @@ Not included (minimal scope):
 [project]  
 dependencies = [  
 	"modal>=0.64.0",  
-	"apache-airflow-core>=3.0.0", # or the appropriate version  
+	"apache-airflow-core>=2.10.0", 
 	"click>=8.0.0",  
 	"pyyaml>=6.0",  
-	"rich>=13.0.0", # for CLI output  
+	"rich>=13.0.0",
+    "psycopg2-binary>=2.9.0", # Postgres driver
 ]
 ```
 
 ## Limitations (Documented for Users)
-1. No Persistent Scheduler - Runs on a cron interval (e.g. 1 min latency).
-2. No Pools/Queues - No resource limiting beyond Modal parallelism.
-3. No Callbacks - No on_success/on_failure callbacks (currently).
-4. SQLite Concurrency - Recommended to use PostgreSQL for >5 concurrent tasks.
-5. Logs - Task logs are in Modal dashboard, not yet fully integrated into Airflow UI.
-6. SQLite: Read-only UI - Cannot trigger DAGs manually from UI.
+1. **Latency**: Minimum ~1 min latency due to cron scheduler.
+2. **Postgres Required**: External Postgres DB needed.
+3. **Zombie Detection**: Slower detection (depends on scheduler tick).
+4. **Parsing**: Slow top-level code in DAGs (>5s) will cause ImportErrors.
