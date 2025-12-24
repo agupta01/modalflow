@@ -1,101 +1,54 @@
-# Test Plan for Serverless Airflow on Modal
+# Test Plan - ModalExecutor
 
-This document outlines the testing strategy for the `modalflow` runtime. Our goal is to ensure stability and correctness while leveraging Modal's serverless infrastructure. We will use `pytest` as our primary runner and integrate specific tests from the Apache Airflow core suite to validate our custom components.
+This plan focuses on verifying the `ModalExecutor` (Phase 1) ensures reliable task execution on Modal's infrastructure.
 
-## 1. Testing Strategy Overview
+## 1. Unit Tests (Local)
+Run via `pytest`. These tests verify the logic of the executor without actually calling Modal.
 
-We will employ a three-tiered testing approach:
-1.  **Unit Tests**: Isolated tests for individual components (CLI, Executor, Scheduler Parsing), utilizing mocks for Modal and Airflow internals.
-2.  **Integration Tests**: Tests verifying the interaction between the `ModalExecutor`, `Scheduler`, and Postgres DB (dockerized for local tests).
-3.  **Core Compatibility Tests**: Running a subset of Apache Airflow's official test suite against our custom `ModalExecutor`.
+### mocks
+-   **`modal.Function`**: Mock `.spawn()` to verify it receives the correct command payload.
+-   **`modal.Dict`**: Use a local python `dict` to simulate remote state updates.
+-   **`modal.Volume`**: Mock file operations.
 
-## 2. Test Environment Setup
+### Test Cases (`tests/unit/test_modal_executor.py`)
+1.  **`execute_async`**:
+    -   Verify command is correctly serialized.
+    -   Verify `spawn()` is called exactly once.
+    -   Verify task is added to `pending_tasks` or `running` set.
+2.  **`sync` (Happy Path)**:
+    -   Simulate a "SUCCESS" entry in the mocked `modal.Dict`.
+    -   Verify `executor.success(key)` is called.
+    -   Verify the entry is removed from the Dict (cleanup).
+3.  **`sync` (Failure Path)**:
+    -   Simulate a "FAILED" entry (non-zero exit code).
+    -   Verify `executor.fail(key)` is called.
+4.  **`sync` (Zombie/Timeout)**:
+    -   Simulate a task staying in `RUNNING` state for > timeout.
+    -   Verify executor marks it as failed or retries (depending on policy).
 
-### Dependencies
--   `pytest`
--   `pytest-mock`
--   `pytest-asyncio`
--   `modal` (client)
--   `apache-airflow-core`
--   `testcontainers` (for local Postgres)
+## 2. Integration Tests (Live Modal)
+Run via `pytest --integration`. These tests deploy a real ephemeral app to Modal.
 
-### Mocking Modal
-To run tests fast and without cloud costs, we will use `unittest.mock` to mock:
--   `modal.Volume`: Mock filesystem operations (read/write/list).
--   `modal.Dict`: Mock dictionary operations with local state.
--   `modal.Function`: Mock `.spawn()` calls.
+### Setup
+-   Requires `MODAL_TOKEN` in environment.
+-   Creates a temporary `modal.Dict` and `modal.Volume` with a unique suffix.
 
-## 3. Component-Level Test Plan
+### Test Cases (`tests/integration/test_live_execution.py`)
+1.  **Hello World**:
+    -   Manually invoke `executor.execute_async()` with a simple command: `echo "hello"`.
+    -   Wait for `sync()` loop to detect success.
+    -   Verify "hello" appears in the logs on the Volume.
+2.  **Environment Variables**:
+    -   Task: `echo $MY_ENV_VAR`.
+    -   Verify the worker correctly inherited or received the env var.
+3.  **Failure Propagation**:
+    -   Task: `exit 1`.
+    -   Verify `executor` detects the failure and alerts Airflow.
 
-### 3.1 Executor (`src/airflow_serverless/executor/modal_executor.py`)
-The `ModalExecutor` is the most critical component.
--   **Unit Tests**:
-    -   `execute_async`: Verify command serialization and `execute_task.spawn` call.
-    -   `sync`: Verify status polling and reconciliation logic (DB vs Dict).
-    -   **Reconciliation Test**: Simulate mismatch where DB=QUEUED and Dict=Missing -> Ensure task is re-queued.
-    -   `terminate`: Verify task cancellation.
--   **Airflow Compliance**:
-    -   Run standard Airflow executor tests.
-    -   Target: `tests/executors/test_base_executor.py` (from Airflow source).
+## 3. Airflow Compatibility Tests
+(Advanced) Mount the `ModalExecutor` into a standalone Airflow process.
 
-### 3.2 Scheduler (`src/airflow_serverless/scheduler/scheduler.py`)
--   **Unit Tests**:
-    -   **Locking**: Verify `pg_try_advisory_lock` usage.
-    -   **Parsing Timeout**: Create a "slow DAG" (sleeps 10s at top level). Verify the scheduler kills the parse process after 5s and records an `ImportError`.
-    -   **Run Creation**: Verify `DagRun` entries in Postgres.
--   **Integration Tests**:
-    -   Simulate `scheduler_tick()`.
-    -   Verify it picks up a DAG from the (mocked) Volume.
-    -   Verify it schedules a task to the `ModalExecutor`.
-    -   Verify state updates in Postgres.
-
-### 3.3 Database & Storage
--   **Database**:
-    -   **Postgres Only**: Use `testcontainers-postgres` for local integration tests.
-    -   Schema initialization: Verify tables are created correctly.
--   **Logging**:
-    -   Test writing logs to `/vol/logs/dag/task/...`.
-    -   Test reading logs via Airflow's `FileTaskHandler`.
-
-### 3.4 CLI & Configuration
--   Test `modalflow create` config parsing.
--   Test `modalflow dags create` validation logic.
-
-## 4. Leveraging Airflow Core Tests
-
-We will run relevant subsets of the Airflow test suite.
-
-| Component | Airflow Test File (Reference) | Goal |
-| :--- | :--- | :--- |
-| **Executor** | `tests/executors/test_base_executor.py` | Verify `ModalExecutor` implements the interface correctly. |
-| **Scheduler** | `tests/jobs/test_scheduler_job.py` | Verify simplified scheduler loop respects task states. |
-| **DAG Parsing** | `tests/models/test_dagbag.py` | Verify DAG loading mimics standard behavior. |
-| **XCom** | `tests/models/test_xcom.py` | Verify `VolumeXComBackend` handles serialization correctly. |
-
-## 5. End-to-End (E2E) Tests
-
-E2E tests will run against a **dev** environment in Modal.
-
-1.  **Deploy Env**: `modalflow create --env test-e2e` (Requires Postgres URL).
-2.  **Upload DAG**: Upload `hello_world.py`.
-3.  **Trigger**: Wait for scheduler cron.
-4.  **Verify**:
-    -   Check `scheduler` logs.
-    -   Check `worker` logs in `/vol/logs/`.
-    -   Check Postgres state for `success`.
-5.  **Teardown**: Remove the test environment.
-
-## 6. Continuous Integration (CI)
-
-1.  **Lint**: `ruff` / `black`.
-2.  **Unit Tests**: `pytest tests/unit` (Mocked Modal).
-3.  **Integration**: `pytest tests/integration` (Local Postgres via Docker).
-4.  **(Optional) Live Tests**: On merge to main.
-
-## 7. Implementation Roadmap (Testing)
-
--   [ ] **Phase 1**: Set up `pytest` fixture for Mock Modal and Local Postgres.
--   [ ] **Phase 2**: Write `ModalExecutor` tests (including reconciliation logic).
--   [ ] **Phase 3**: Port `test_base_executor.py`.
--   [ ] **Phase 4**: Write "Slow Parsing" tests for Scheduler.
--   [ ] **Phase 5**: Write Logging I/O tests.
+1.  **Setup**: Install `modalflow` in a local Airflow venv.
+2.  **Config**: Set `AIRFLOW__CORE__EXECUTOR=modalflow.executor.modal_executor.ModalExecutor`.
+3.  **Run**: Trigger a simple DAG.
+4.  **Verify**: Check that the task runs on Modal (via Modal dashboard) and succeeds in Airflow UI.
