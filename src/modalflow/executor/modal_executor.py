@@ -1,12 +1,8 @@
-import json
-import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from airflow.executors.base_executor import BaseExecutor
 from airflow.models.taskinstance import TaskInstanceKey
-from airflow.utils.state import TaskInstanceState
 
-# Import the Modal components
 from modalflow.modal_app import execute_modal_task, state_dict
 
 class ModalExecutor(BaseExecutor):
@@ -16,7 +12,6 @@ class ModalExecutor(BaseExecutor):
     
     def __init__(self, parallelism: int = 10):
         super().__init__(parallelism=parallelism)
-        self.log = logging.getLogger(__name__)
         self.active_tasks: Dict[str, TaskInstanceKey] = {}
 
     def start(self):
