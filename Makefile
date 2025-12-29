@@ -21,6 +21,7 @@ system.setup:
 	@cp tests/system/requirements.txt tests/system-runner/files/requirements.txt
 	@cp tests/system/init.sh tests/system-runner/files/airflow-breeze-config/init.sh
 	@cp tests/system/environment_variables.env tests/system-runner/files/airflow-breeze-config/environment_variables.env
+	@cp ~/.modal.toml tests/system-runner/files/.modal.toml
 
 system.teardown:
 	@echo "Stopping and cleaning up system test runner environment..."

@@ -1,5 +1,18 @@
 # Implementation Plan - Phase 1: ModalExecutor
 
+## 12/29 Updates
+
+- Using `breeze` instead of `astro` CLI for testing because it allows for remote testing runs. ie. (`breeze testing core ...`)
+    - Is this a real benefit? Unit test should be mocked anyways, and integration tests can be done by spinning up a modal Sandbox and then testing within that
+    - Decision: attempt to move to `astro` CLI, where we run the astro CLI in a modal Sandbox
+- When spawning modal Functions in current design (Airflow 3.0+), the ExecuteTask workload (executed by `airflow.sdk.execution_time.execute_workload`) attempts to use the Task Execution API (AIP-72) to execute the task. This requires the worker to "phone home" to the executor, which means it makes a call to `http://localhost:8080/execution`. As expected because this call is being made from the modal Function to the local machine where the breeze Airflow testing stack is running, this call fails. This points to an issue with the networking setup of the Modal Function.
+    - The Lambda Executor gets around this issue because it's expected the executing lambda is deployed in the same VPC/Networking stack as the Airflow deployment. For example, if the user is using MWAA deployed in a VPC, they would deploy the execution lambda in the same VPC, ensuring the Airflow deployment can "see" the worker invocations and vice-versa.
+
+### Future ideas
+- Migrate the modal Function to be a modal Sandbox (since there's no unique business logic, it's just a subprocess command), this also would make the solution deploy-free — users don't need to `modal deploy` before usage, all other primitives (App, logs Volume, Dict) can be created if they don't exist already in the Executor's `start()` function
+- Dynamic caching (after Sandbox migration): for task names that are recurring, create a [Sandbox snapshot](https://modal.com/docs/guide/sandbox-snapshots), which is an Image, and store it in a lookup table/LRU cache. When the task comes up again, use this snapshot to enable faster task starts.
+- Modal credentials as Airflow Connection object
+
 ## Goal
 Build `modalflow`, a python package providing a `ModalExecutor` class. This executor allows standard Airflow environments (local, EC2, K8s) to run tasks as ephemeral Modal Functions.
 
@@ -52,18 +65,18 @@ Defines the Modal infrastructure.
 ## Detailed Steps
 
 ### Step 1: Project Skeleton & Configuration
--   [ ] Rename/Move existing files to match `modalflow` structure.
--   [ ] Update `pyproject.toml` with dependencies: `apache-airflow`, `modal`.
--   [ ] Create `src/modalflow/executor/` and `src/modalflow/tests/`.
+-   [x] Rename/Move existing files to match `modalflow` structure.
+-   [x] Update `pyproject.toml` with dependencies: `apache-airflow`, `modal`.
+-   [x] Create `src/modalflow/executor/` and `src/modalflow/tests/`.
 
 ### Step 2: The Modal App Definition
--   [ ] Implement `modal_app.py` defining the generic Airflow image and shared Volume/Dict.
--   [ ] Implement the worker function `execute_modal_task` that runs the raw command and handles logging.
+-   [x] Implement `modal_app.py` defining the generic Airflow image and shared Volume/Dict.
+-   [x] Implement the worker function `execute_modal_task` that runs the raw command and handles logging.
 
 ### Step 3: `ModalExecutor` Implementation
--   [ ] Implement `execute_async` to spawn the worker.
--   [ ] Implement `sync` to read from `modal.Dict`.
--   [ ] Implement `cleanup` logic (removing old keys from Dict).
+-   [x] Implement `execute_async` to spawn the worker.
+-   [x] Implement `sync` to read from `modal.Dict`.
+-   [x] Implement `cleanup` logic (removing old keys from Dict).
 
 ### Step 4: Logging Integration
 -   [ ] Ensure `execute_modal_task` writes logs to the correct hierarchy: `dag_id/task_id/run_id/attempt.log` on the Volume.
