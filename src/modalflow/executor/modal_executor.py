@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import os
+import socket
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
+from urllib.parse import urljoin
 
 import modal
+import requests
+from airflow.configuration import conf
 from airflow.executors.base_executor import BaseExecutor
 from airflow.executors import workloads as executor_workloads
 from airflow.models.taskinstance import TaskInstanceKey
@@ -31,6 +36,9 @@ class ModalExecutor(BaseExecutor):
         # These will be initialized in start()
         self._modal_function = None
         self._state_dict = None
+        self._tunnel_context = None  # Store the context manager
+        self._tunnel = None  # Store the tunnel object from __enter__()
+        self._execution_api_url = None
 
     @property
     def slots_available(self) -> int:
@@ -43,6 +51,7 @@ class ModalExecutor(BaseExecutor):
     def start(self):
         """
         Initialize the executor by looking up the deployed Modal function and state dict.
+        Also sets up networking (tunnel for local or production URL).
         """
         self.log.info("Starting ModalExecutor")
 
@@ -68,6 +77,44 @@ class ModalExecutor(BaseExecutor):
         except Exception as e:
             self.log.error(f"Failed to connect to Modal Dict {dict_name}: {e}")
             raise
+
+        # Set up networking for execution API
+        try:
+            if self._is_local_environment():
+                # Create tunnel to localhost:8080
+                # modal.forward() returns a context manager - we need to enter it and keep it alive
+                try:
+                    self._tunnel_context = modal.forward(8080)
+                    self._tunnel = self._tunnel_context.__enter__()
+                    tunnel_url = self._tunnel.url
+                    self._execution_api_url = urljoin(tunnel_url, "/execution/")
+                    self.log.info(
+                        f"Created tunnel for local Airflow API: {self._execution_api_url}"
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to create tunnel to localhost:8080. "
+                        f"Ensure Airflow is running on localhost:8080. Error: {e}"
+                    ) from e
+            else:
+                # Production: read from Airflow config
+                try:
+                    self._execution_api_url = self._get_production_api_url()
+                    self.log.info(
+                        f"Using production API URL: {self._execution_api_url}"
+                    )
+                except ValueError as e:
+                    # Re-raise ValueError with clearer context
+                    raise ValueError(
+                        f"Production execution API URL not configured. {str(e)}"
+                    ) from e
+        except (RuntimeError, ValueError) as e:
+            # These are expected errors - re-raise with clear messages
+            raise
+        except Exception as e:
+            # Unexpected errors
+            self.log.error(f"Unexpected error setting up execution API URL: {e}")
+            raise RuntimeError(f"Failed to set up execution API URL: {e}") from e
 
     def execute_async(
         self,
@@ -106,6 +153,12 @@ class ModalExecutor(BaseExecutor):
             "workload_json": serialized_workload,
             "env": self._get_task_env(key, executor_config),
         }
+
+        # Ensure execution API URL is set before spawning
+        if self._execution_api_url is None:
+            raise RuntimeError(
+                "Execution API URL not configured. Ensure start() was called successfully."
+            )
 
         # Spawn the function asynchronously
         # .spawn() returns a FunctionCall object, but we rely on the Dict for status
@@ -208,10 +261,22 @@ class ModalExecutor(BaseExecutor):
 
     def end(self) -> None:
         """
-        Terminate the executor.
+        Terminate the executor and cleanup resources.
         """
         self.log.info("Shutting down ModalExecutor")
         self.heartbeat_interval = 0
+
+        # Cleanup tunnel if it exists
+        if self._tunnel_context is not None:
+            try:
+                # Exit the context manager
+                self._tunnel_context.__exit__(None, None, None)
+                self.log.info("Closed tunnel")
+            except Exception as e:
+                self.log.warning(f"Error closing tunnel: {e}")
+            finally:
+                self._tunnel_context = None
+                self._tunnel = None
 
     def terminate(self) -> None:
         """
@@ -228,13 +293,113 @@ class ModalExecutor(BaseExecutor):
         # We construct a stable string key
         return f"{key.dag_id}:{key.task_id}:{key.run_id}:{key.try_number}"
 
+    def _is_local_environment(self) -> bool:
+        """
+        Check if we're running in a local environment by testing if localhost:8080 is accessible.
+
+        Returns:
+            True if localhost:8080 is accessible, False otherwise
+        """
+        try:
+            # Try to connect to localhost:8080
+            response = requests.get("http://localhost:8080/health", timeout=2)
+            # If we get any response (even 404), localhost is accessible
+            return True
+        except (
+            requests.exceptions.RequestException,
+            socket.timeout,
+            ConnectionRefusedError,
+        ):
+            # Connection failed - not a local environment
+            return False
+
+    def _get_production_api_url(self) -> str:
+        """
+        Get the execution API URL from Airflow configuration.
+
+        Reads from:
+        1. Environment variable AIRFLOW__CORE__EXECUTION_API_SERVER_URL (takes precedence)
+        2. Airflow config: core.execution_api_server_url
+        3. Constructs default from api.base_url if available
+
+        Returns:
+            Execution API URL string
+
+        Raises:
+            ValueError: If URL cannot be determined
+        """
+        # Check environment variable first (takes precedence)
+        env_url = os.environ.get("AIRFLOW__CORE__EXECUTION_API_SERVER_URL")
+        if env_url:
+            self._validate_api_url(env_url)
+            return env_url
+
+        # Check Airflow config
+        try:
+            config_url = conf.get("core", "execution_api_server_url", fallback=None)
+            if config_url:
+                self._validate_api_url(config_url)
+                return config_url
+        except Exception as e:
+            self.log.warning(f"Error reading execution_api_server_url from config: {e}")
+
+        # Try to construct from base_url
+        try:
+            base_url = conf.get("api", "base_url", fallback="/")
+            if base_url.startswith("/"):
+                # Relative URL - construct default
+                default_url = f"http://localhost:8080{base_url.rstrip('/')}/execution/"
+                self.log.warning(
+                    f"execution_api_server_url not configured. Using default: {default_url}. "
+                    "This may not work in production. Set AIRFLOW__CORE__EXECUTION_API_SERVER_URL "
+                    "or configure core.execution_api_server_url in airflow.cfg"
+                )
+                return default_url
+            else:
+                # Absolute URL - append /execution/
+                execution_url = urljoin(base_url.rstrip("/"), "/execution/")
+                self._validate_api_url(execution_url)
+                return execution_url
+        except Exception as e:
+            self.log.error(f"Error constructing execution API URL from base_url: {e}")
+
+        # If we get here, we couldn't determine the URL
+        raise ValueError(
+            "execution_api_server_url not configured. Set AIRFLOW__CORE__EXECUTION_API_SERVER_URL "
+            "or ensure Airflow config has core.execution_api_server_url"
+        )
+
+    def _validate_api_url(self, url: str) -> None:
+        """
+        Validate that the execution API URL is properly formatted.
+
+        Args:
+            url: URL string to validate
+
+        Raises:
+            ValueError: If URL is invalid
+        """
+        if not url:
+            raise ValueError("Execution API URL cannot be empty")
+
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise ValueError(
+                f"Execution API URL must start with http:// or https://: {url}"
+            )
+
     def _get_task_env(self, key: TaskInstanceKey, executor_config: Any) -> Dict[str, str]:
         """
         Gather environment variables to pass to the worker.
+
+        Includes the execution API URL so Modal Functions can phone home.
         """
-        # BaseExecutor doesn't inherently give us the full task env.
-        # But we can pass specific vars if needed.
-        # For now, we return a basic set.
-        return {
+        if self._execution_api_url is None:
+            raise RuntimeError(
+                "Execution API URL not set. Ensure start() was called successfully."
+            )
+
+        env = {
             "AIRFLOW__CORE__EXECUTOR": "modalflow.executor.modal_executor.ModalExecutor",
+            "AIRFLOW__CORE__EXECUTION_API_SERVER_URL": self._execution_api_url,
         }
+        return env

@@ -1,33 +1,46 @@
-.PHONY: build system.setup system.teardown unit.test
+.PHONY: build system.setup system.test system.teardown unit.test
 
 build:
 	@uv build
 
-# Set up and start the Astro dev environment for system tests
+# Set up the Sandbox for system tests
+# This prepares files and creates/updates the Modal Sandbox
 system.setup:
-	@echo "Setting up system test runner..."
-	@if [ ! -d "tests/system-runner" ]; then \
-		echo "Cloning airflow test repo into tests/system-runner..."; \
-		git clone git@github.com:agupta01/airflow.git tests/system-runner; \
-	else \
-		echo "tests/system-runner already exists, skipping clone."; \
-	fi
-	@echo "Installing dev breeze environment with uv tool..."
-	@uv tool install -e ./tests/system-runner/dev/breeze --force
-	@echo "Copying built package to system test folder. To update the package, run 'uv build'."
-	@mkdir -p tests/system-runner/files/plugins
-	@mkdir -p tests/system-runner/files/airflow-breeze-config
-	@cp -r dist/*.whl tests/system-runner/files/plugins
-	@cp tests/system/requirements.txt tests/system-runner/files/requirements.txt
-	@cp tests/system/init.sh tests/system-runner/files/airflow-breeze-config/init.sh
-	@cp tests/system/environment_variables.env tests/system-runner/files/airflow-breeze-config/environment_variables.env
-	@cp ~/.modal.toml tests/system-runner/files/.modal.toml
+	@echo "Setting up system test Sandbox..."
+	@echo "Building package..."
+	@uv build
+	@echo "Setting up Sandbox with astro CLI..."
+	@uv run python -m modal deploy tests/system/test_app.py
+	@echo "Sandbox setup complete. Run 'make system.test' to start tests."
 
+# Run system tests using astro CLI in Modal Sandbox
+system.test:
+	@echo "Starting astro dev in Sandbox..."
+	@echo "Note: This will create a Sandbox, set up astro project, and start Airflow."
+	@echo "Output will be streamed to stdout."
+	@uv run python -c "\
+import sys; \
+sys.path.insert(0, 'tests/system'); \
+from test_app import create_test_sandbox, setup_astro_project, start_astro_dev; \
+sb = create_test_sandbox(); \
+setup_astro_project(sb); \
+start_astro_dev(sb); \
+"
+
+# Alternative: Use modal CLI to run commands in Sandbox
+# This approach uses modal run to execute commands
+system.test.modal:
+	@echo "Starting astro dev via modal run..."
+	@uv run modal run tests/system/test_app.py::start_astro_dev
+
+# Teardown: Terminate the Sandbox
 system.teardown:
-	@echo "Stopping and cleaning up system test runner environment..."
-	@cd tests/system-runner/dev/breeze && breeze down || true
-	@echo "Removing runner directory..."
-	@rm -rf tests/system-runner
+	@echo "Terminating system test Sandbox..."
+	@uv run python -c "\
+import modal; \
+sb = modal.Sandbox.from_name('modalflow-test-runner', 'modalflow-system-runner'); \
+sb.terminate(); \
+" || echo "Sandbox not found or already terminated"
 
 # Run unit tests with pytest
 unit.test:
