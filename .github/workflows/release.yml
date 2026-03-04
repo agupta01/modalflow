@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  release:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 2
+
+      - name: Check if last commit is a version bump (prevent loops)
+        id: check
+        run: |
+          last_author=$(git log -1 --format='%an')
+          if [ "$last_author" = "github-actions[bot]" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine bump type from PR
+        if: steps.check.outputs.skip == 'false'
+        id: bump
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_BODY="${{ github.event.pull_request.body }}"
+
+          if echo "$PR_TITLE" | grep -qi '^feat' && echo "$PR_BODY" | grep -qi 'BREAKING CHANGE'; then
+            echo "type=major" >> "$GITHUB_OUTPUT"
+          elif echo "$PR_TITLE" | grep -qi '^feat'; then
+            echo "type=minor" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=patch" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump version in pyproject.toml
+        if: steps.check.outputs.skip == 'false'
+        id: version
+        run: |
+          python3 -c "
+          import re, pathlib
+
+          path = pathlib.Path('pyproject.toml')
+          text = path.read_text()
+          match = re.search(r'version\s*=\s*\"(\d+)\.(\d+)\.(\d+)\"', text)
+          major, minor, patch = int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+          bump = '${{ steps.bump.outputs.type }}'
+          if bump == 'major':
+              major += 1; minor = 0; patch = 0
+          elif bump == 'minor':
+              minor += 1; patch = 0
+          else:
+              patch += 1
+
+          new_version = f'{major}.{minor}.{patch}'
+          text = re.sub(r'(version\s*=\s*\")(\d+\.\d+\.\d+)(\")', rf'\g<1>{new_version}\g<3>', text)
+          path.write_text(text)
+          print(new_version)
+          " | tee /tmp/new_version
+
+          echo "new_version=$(cat /tmp/new_version)" >> "$GITHUB_OUTPUT"
+
+      - name: Commit version bump
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "chore: bump version to ${{ steps.version.outputs.new_version }}"
+          git push origin main
+
+      - name: Create GitHub release
+        if: steps.check.outputs.skip == 'false'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ steps.version.outputs.new_version }}
+          commit: main
+          generateReleaseNotes: true
