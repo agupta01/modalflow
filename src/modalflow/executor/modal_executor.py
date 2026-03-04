@@ -29,6 +29,8 @@ class ModalExecutor(BaseExecutor):
     An Airflow Executor that runs tasks as Modal Functions.
     """
 
+    is_local: bool = True
+
     def __init__(self):
         # Use the same concurrency limit as the Modal function
         super().__init__(parallelism=CONCURRENCY_LIMIT)

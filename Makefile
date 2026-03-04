@@ -4,34 +4,31 @@ build:
 	@uv build
 
 # Set up the Sandbox for system tests
-# This prepares files and creates/updates the Modal Sandbox
+# This builds the package wheel needed by the Sandbox image
 system.setup:
 	@echo "Setting up system test Sandbox..."
 	@echo "Building package..."
 	@uv build
-	@echo "Setting up Sandbox with astro CLI..."
-	@uv run python -m modal deploy tests/system/test_app.py
-	@echo "Sandbox setup complete. Run 'make system.test' to start tests."
+	@chmod 644 dist/*.whl
+	@echo "Setup complete. Run 'make system.test' to start tests."
 
-# Run system tests using astro CLI in Modal Sandbox
+# Run system tests using airflow standalone in Modal Sandbox
 system.test:
-	@echo "Starting astro dev in Sandbox..."
-	@echo "Note: This will create a Sandbox, set up astro project, and start Airflow."
+	@echo "Starting airflow standalone in Sandbox..."
+	@echo "Note: This will create a Sandbox and start Airflow with ModalExecutor."
 	@echo "Output will be streamed to stdout."
 	@uv run python -c "\
 import sys; \
 sys.path.insert(0, 'tests/system'); \
-from test_app import create_test_sandbox, setup_astro_project, start_astro_dev; \
+from test_app import create_test_sandbox, start_airflow; \
 sb = create_test_sandbox(); \
-setup_astro_project(sb); \
-start_astro_dev(sb); \
+start_airflow(sb); \
 "
 
 # Alternative: Use modal CLI to run commands in Sandbox
-# This approach uses modal run to execute commands
 system.test.modal:
-	@echo "Starting astro dev via modal run..."
-	@uv run modal run tests/system/test_app.py::start_astro_dev
+	@echo "Starting airflow standalone via modal run..."
+	@uv run modal run tests/system/test_app.py::start_airflow
 
 # Teardown: Terminate the Sandbox
 system.teardown:
