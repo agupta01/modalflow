@@ -1,33 +1,42 @@
-.PHONY: build system.setup system.teardown unit.test
+.PHONY: build system.setup system.test system.teardown unit.test
 
 build:
 	@uv build
 
-# Set up and start the Astro dev environment for system tests
+# Set up the Sandbox for system tests
+# This builds the package wheel needed by the Sandbox image
 system.setup:
-	@echo "Setting up system test runner..."
-	@if [ ! -d "tests/system-runner" ]; then \
-		echo "Cloning airflow test repo into tests/system-runner..."; \
-		git clone git@github.com:agupta01/airflow.git tests/system-runner; \
-	else \
-		echo "tests/system-runner already exists, skipping clone."; \
-	fi
-	@echo "Installing dev breeze environment with uv tool..."
-	@uv tool install -e ./tests/system-runner/dev/breeze --force
-	@echo "Copying built package to system test folder. To update the package, run 'uv build'."
-	@mkdir -p tests/system-runner/files/plugins
-	@mkdir -p tests/system-runner/files/airflow-breeze-config
-	@cp -r dist/*.whl tests/system-runner/files/plugins
-	@cp tests/system/requirements.txt tests/system-runner/files/requirements.txt
-	@cp tests/system/init.sh tests/system-runner/files/airflow-breeze-config/init.sh
-	@cp tests/system/environment_variables.env tests/system-runner/files/airflow-breeze-config/environment_variables.env
-	@cp ~/.modal.toml tests/system-runner/files/.modal.toml
+	@echo "Setting up system test Sandbox..."
+	@echo "Building package..."
+	@uv build
+	@chmod 644 dist/*.whl
+	@echo "Setup complete. Run 'make system.test' to start tests."
 
+# Run system tests using airflow standalone in Modal Sandbox
+system.test:
+	@echo "Starting airflow standalone in Sandbox..."
+	@echo "Note: This will create a Sandbox and start Airflow with ModalExecutor."
+	@echo "Output will be streamed to stdout."
+	@uv run python -c "\
+import sys; \
+sys.path.insert(0, 'tests/system'); \
+from test_app import run_test; \
+run_test(); \
+"
+
+# Alternative: Use modal CLI to run commands in Sandbox
+system.test.modal:
+	@echo "Starting airflow standalone via modal run..."
+	@uv run modal run tests/system/test_app.py::start_airflow
+
+# Teardown: Terminate the Sandbox
 system.teardown:
-	@echo "Stopping and cleaning up system test runner environment..."
-	@cd tests/system-runner/dev/breeze && breeze down || true
-	@echo "Removing runner directory..."
-	@rm -rf tests/system-runner
+	@echo "Terminating system test Sandbox..."
+	@uv run python -c "\
+import modal; \
+sb = modal.Sandbox.from_name('modalflow-test-runner', 'modalflow-system-runner'); \
+sb.terminate(); \
+" || echo "Sandbox not found or already terminated"
 
 # Run unit tests with pytest
 unit.test:
