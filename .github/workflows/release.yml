@@ -20,10 +20,10 @@ jobs:
 
       - name: Determine bump type from PR
         id: bump
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          PR_BODY="${{ github.event.pull_request.body }}"
-
           if echo "$PR_TITLE" | grep -qi '^feat' && echo "$PR_BODY" | grep -qi 'BREAKING CHANGE'; then
             echo "type=major" >> "$GITHUB_OUTPUT"
           elif echo "$PR_TITLE" | grep -qi '^feat'; then
