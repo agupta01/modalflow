@@ -81,7 +81,6 @@ def start_airflow(sandbox: modal.Sandbox) -> None:
         print(line, end="")
     proc.wait()
 
-
 # ---------------------------------------------------------------------------
 # E2E test classes (run via pytest)
 # ---------------------------------------------------------------------------
@@ -135,8 +134,14 @@ class TestFailurePropagation:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "start":
+    if len(sys.argv) > 1 and sys.argv[1] == "run":
+        run_test()
+    elif len(sys.argv) > 1 and sys.argv[1] == "start":
         sb = modal.Sandbox.from_name("modalflow-test-runner", "modalflow-system-runner")
-        start_airflow(sb)
+        try:
+          start_airflow(sb)
+        finally:
+          print("Terminating sandbox...")
+          sb.terminate()
     else:
-        print("Usage: python test_app.py [start]")
+        print("Usage: python test_app.py [run|start]")

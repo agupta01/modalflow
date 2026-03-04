@@ -22,9 +22,8 @@ system.test:
 	@uv run python -c "\
 import sys; \
 sys.path.insert(0, 'tests/system'); \
-from test_app import create_test_sandbox, start_airflow; \
-sb = create_test_sandbox(); \
-start_airflow(sb); \
+from test_app import run_test; \
+run_test(); \
 "
 
 # Run E2E system tests via pytest
