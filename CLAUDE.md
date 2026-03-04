@@ -7,12 +7,16 @@
 
 ## System test infrastructure
 
-- Base image: `apache/airflow:3.0.6-python3.10`. The airflow user (uid 50000) owns the Python environment.
+- Base image: `apache/airflow:3.0.6-python3.10`, upgraded to 3.1.5 via pip. The airflow user (uid 50000) owns the Python environment.
 - **pip must run as the `airflow` user**, not root. Use `su -s /bin/bash airflow -c "pip install ..."` in `run_commands`.
 - `uv build` creates wheels with 600 permissions; `make system.setup` runs `chmod 644` to fix this.
 - `airflow standalone` checks `executor_class.is_local` and forces LocalExecutor if False. ModalExecutor sets `is_local = True` to bypass this.
 - Output from `airflow standalone` requires `PYTHONUNBUFFERED=1` to stream in real time (no TTY in sandbox).
 - Use `runuser -u airflow` (not `su`) for exec'd commands — `su` buffers stdout.
+- Airflow 3.0.6 uses old-style `queue_command` (tuples); 3.1.x uses `queue_workload` (ExecuteTask objects). Must use 3.1.x.
+- `modal.forward()` only works inside Modal Functions, not Sandboxes. Use `encrypted_ports=[8080]` + `sandbox.tunnels()` for Sandbox networking.
+- The Modal function image **must include DAG files** — `execute_workload` loads DAGs to get task definitions. Set `MODALFLOW_DAGS_DIR` before deploying.
+- E2E tests: `make system.setup` (build + deploy with DAGs) then `make system.test.e2e` (pytest).
 
 ## Modal patterns
 

@@ -1,4 +1,4 @@
-.PHONY: build system.setup system.test system.teardown unit.test
+.PHONY: build system.setup system.test system.test.e2e system.teardown unit.test
 
 build:
 	@uv build
@@ -10,7 +10,9 @@ system.setup:
 	@echo "Building package..."
 	@uv build
 	@chmod 644 dist/*.whl
-	@echo "Setup complete. Run 'make system.test' to start tests."
+	@echo "Deploying modalflow-main (with test DAGs)..."
+	@MODALFLOW_DAGS_DIR=tests/system/dags uv run modal deploy src/modalflow/modal_app.py
+	@echo "Setup complete. Run 'make system.test.e2e' to start tests."
 
 # Run system tests using airflow standalone in Modal Sandbox
 system.test:
@@ -23,6 +25,11 @@ sys.path.insert(0, 'tests/system'); \
 from test_app import run_test; \
 run_test(); \
 "
+
+# Run E2E system tests via pytest
+system.test.e2e:
+	@echo "Running E2E system tests..."
+	@uv run pytest tests/system/ -v -x --timeout=600
 
 # Alternative: Use modal CLI to run commands in Sandbox
 system.test.modal:
