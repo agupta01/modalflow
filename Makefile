@@ -1,4 +1,4 @@
-.PHONY: build system.setup system.test system.test.e2e system.teardown unit.test
+.PHONY: build system.setup system.setup.volume system.test system.test.e2e system.test.e2e.volume system.teardown unit.test
 
 build:
 	@uv build
@@ -13,6 +13,18 @@ system.setup:
 	@echo "Deploying modalflow-main (with test DAGs)..."
 	@MODALFLOW_DAGS_DIR=tests/system/dags uv run modal deploy src/modalflow/modal_app.py
 	@echo "Setup complete. Run 'make system.test.e2e' to start tests."
+
+# Set up system tests with volume-based DAG loading
+system.setup.volume:
+	@echo "Setting up system test with volume-based DAGs..."
+	@echo "Building package..."
+	@uv build
+	@chmod 644 dist/*.whl
+	@echo "Deploying modalflow-main (volume mode, no baked DAGs)..."
+	@MODALFLOW_DAGS_VOLUME=test-dags-vol uv run modal deploy src/modalflow/modal_app.py
+	@echo "Uploading DAGs to volume..."
+	@uv run modalflow sync --dags-path tests/system/dags --dags-volume test-dags-vol
+	@echo "Setup complete. Run 'make system.test.e2e.volume' to start tests."
 
 # Run system tests using airflow standalone in Modal Sandbox
 system.test:
@@ -29,7 +41,12 @@ run_test(); \
 # Run E2E system tests via pytest
 system.test.e2e:
 	@echo "Running E2E system tests..."
-	@uv run pytest tests/system/ -v -x --timeout=600
+	@uv run pytest tests/system/test_app.py -v -x --timeout=600
+
+# Run E2E tests for volume-based DAG loading
+system.test.e2e.volume:
+	@echo "Running volume DAG E2E tests..."
+	@uv run pytest tests/system/test_volume_dags.py -v -x --timeout=600
 
 # Alternative: Use modal CLI to run commands in Sandbox
 system.test.modal:

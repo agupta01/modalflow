@@ -11,9 +11,11 @@ ENV = os.environ.get("MODALFLOW_ENV", "main")
 # This should match the executor's parallelism setting
 CONCURRENCY_LIMIT = 100
 
-# Optional: path to DAGs directory to include in the image.
-# Set MODALFLOW_DAGS_DIR to include DAGs so the task worker can load them.
-DAGS_DIR = os.environ.get("MODALFLOW_DAGS_DIR", None)
+# DAG source configuration (set by CLI at deploy time)
+DAGS_DIR = os.environ.get("MODALFLOW_DAGS_DIR", None)            # local mode
+DAGS_VOLUME_NAME = os.environ.get("MODALFLOW_DAGS_VOLUME", None)  # volume mode
+DAGS_BUCKET = os.environ.get("MODALFLOW_DAGS_BUCKET", None)       # cloud-bucket mode
+DAGS_BUCKET_SECRET = os.environ.get("MODALFLOW_DAGS_BUCKET_SECRET", None)
 
 # Define the base image
 # We use the official Airflow image to ensure compatibility.
@@ -32,8 +34,8 @@ airflow_image = (
     )
 )
 
-# Include DAG files in the image if a DAGs directory is specified.
-# The task worker (execute_workload) needs DAG files to load task definitions.
+# Include DAG files in the image only for local mode.
+# Volume and cloud-bucket modes mount DAGs at runtime instead.
 if DAGS_DIR:
     airflow_image = airflow_image.add_local_dir(
         DAGS_DIR, remote_path="/opt/airflow/dags", copy=True
@@ -50,9 +52,43 @@ log_volume = modal.Volume.from_name(f"airflow-logs-{ENV}", create_if_missing=Tru
 # Maps task_key -> {status, return_code, last_updated}
 state_dict = modal.Dict.from_name(f"airflow-state-{ENV}", create_if_missing=True)
 
+# Build volumes dict dynamically based on DAG source.
+# Both modal.Volume and modal.CloudBucketMount are accepted in the volumes dict.
+function_volumes = {"/opt/airflow/logs": log_volume}
+
+if DAGS_VOLUME_NAME:
+    dags_volume = modal.Volume.from_name(DAGS_VOLUME_NAME, create_if_missing=True)
+    function_volumes["/opt/airflow/dags"] = dags_volume
+
+if DAGS_BUCKET:
+    # Parse S3 URI: s3://bucket-name/optional/prefix
+    bucket_path = DAGS_BUCKET.removeprefix("s3://")
+    parts = bucket_path.split("/", 1)
+    bucket_name = parts[0]
+    key_prefix = parts[1] if len(parts) > 1 else ""
+
+    mount_kwargs = {"bucket_name": bucket_name}
+    if key_prefix:
+        mount_kwargs["key_prefix"] = key_prefix
+    if DAGS_BUCKET_SECRET:
+        mount_kwargs["secret"] = modal.Secret.from_name(DAGS_BUCKET_SECRET)
+
+    function_volumes["/opt/airflow/dags"] = modal.CloudBucketMount(**mount_kwargs)
+
+# Pass DAG source env vars to the function container so that conditional
+# volume/mount definitions evaluate identically on the remote side.
+function_env = {}
+if DAGS_VOLUME_NAME:
+    function_env["MODALFLOW_DAGS_VOLUME"] = DAGS_VOLUME_NAME
+if DAGS_BUCKET:
+    function_env["MODALFLOW_DAGS_BUCKET"] = DAGS_BUCKET
+if DAGS_BUCKET_SECRET:
+    function_env["MODALFLOW_DAGS_BUCKET_SECRET"] = DAGS_BUCKET_SECRET
+
 
 @app.function(
-    volumes={"/opt/airflow/logs": log_volume},
+    volumes=function_volumes,
+    env=function_env or None,
     timeout=3600,  # Default 1 hour timeout
     max_containers=CONCURRENCY_LIMIT,
 )
