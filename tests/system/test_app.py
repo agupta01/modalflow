@@ -7,14 +7,18 @@ Airflow with the ModalExecutor configured.
 import sys
 from pathlib import Path
 
+import glob
+
 import modal
 
 dist_path = Path(__file__).parent.parent.parent / "dist"
 test_dir = Path(__file__).parent
 dags_dir = test_dir / "dags"
 
-WHL_NAME = "modalflow-0.1.0-py3-none-any.whl"
-whl_path = dist_path / WHL_NAME
+whl_files = glob.glob(str(dist_path / "modalflow-*.whl"))
+assert whl_files, f"No wheel found in {dist_path}"
+whl_path = Path(whl_files[0])
+WHL_NAME = whl_path.name
 
 airflow_test_image = (
     modal.Image.from_registry("apache/airflow:3.0.6-python3.10")
