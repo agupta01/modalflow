@@ -87,3 +87,4 @@ jobs:
           tag: v${{ steps.version.outputs.new_version }}
           commit: main
           generateReleaseNotes: true
+          token: ${{ secrets.RELEASE_TOKEN }}
