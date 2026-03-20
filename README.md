@@ -85,7 +85,8 @@ The executor resolves the execution API URL in priority order:
 
 1. `AIRFLOW__CORE__EXECUTION_API_SERVER_URL` environment variable
 2. `core.execution_api_server_url` in `airflow.cfg`
-3. `modal.forward()` tunnel (local development only)
+
+The URL **must** end with `/execution/` — the executor appends this automatically if missing. See [apache/airflow#51235](https://github.com/apache/airflow/issues/51235) for background.
 
 ### Production
 
@@ -106,16 +107,18 @@ Common ways to expose the API:
 When running Airflow locally (e.g. `airflow standalone`), Modal functions need to reach your local execution API. Use a reverse tunnel (ngrok, Cloudflare Tunnel, etc.) and set the URL:
 
 ```bash
-export AIRFLOW__CORE__EXECUTION_API_SERVER_URL=https://your-tunnel-url.ngrok-free.app
+export AIRFLOW__CORE__EXECUTION_API_SERVER_URL=https://your-tunnel-url.ngrok-free.app/execution/
 ```
 
 See `.env.example` for a full local development template.
 
-**Important:** deploy with `--airflow-version` matching your local Airflow version to avoid API version mismatches:
+**Important:** deploy with `--airflow-version` matching your local Airflow version to avoid API version mismatches between the SDK on Modal and your local Airflow server:
 
 ```bash
 modalflow deploy --dags-source local --dags-path ./dags --airflow-version 3.1.8
 ```
+
+> **Note:** Only DAGs you deploy to Modal (via `--dags-path`) are available to task workers. Airflow's built-in example DAGs use a separate bundle (`example_dags`) that isn't present on Modal, so they will fail. Use your own DAGs.
 
 ## Development
 
