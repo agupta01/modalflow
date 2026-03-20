@@ -278,6 +278,12 @@ class ModalExecutor(BaseExecutor):
         2. Airflow config: core.execution_api_server_url
         3. modal.forward() tunnel (only works inside Modal Functions)
 
+        The URL must end with ``/execution/`` because the Airflow task SDK
+        uses relative paths (e.g. ``task-instances/{id}/run``).  If the
+        configured URL doesn't include this suffix, we append it
+        automatically so requests route to the execution API sub-app
+        instead of the REST API.
+
         Returns:
             Execution API URL string
 
@@ -288,14 +294,14 @@ class ModalExecutor(BaseExecutor):
         env_url = os.environ.get("AIRFLOW__CORE__EXECUTION_API_SERVER_URL")
         if env_url:
             self._validate_api_url(env_url)
-            return env_url
+            return self._ensure_execution_prefix(env_url)
 
         # 2. Check Airflow config
         try:
             config_url = conf.get("core", "execution_api_server_url", fallback=None)
             if config_url:
                 self._validate_api_url(config_url)
-                return config_url
+                return self._ensure_execution_prefix(config_url)
         except Exception as e:
             self.log.warning(f"Error reading execution_api_server_url from config: {e}")
 
@@ -307,7 +313,7 @@ class ModalExecutor(BaseExecutor):
             self._tunnel_context = modal.forward(8080)
             self._tunnel = self._tunnel_context.__enter__()
             tunnel_url = self._tunnel.url
-            return urljoin(tunnel_url, "/execution/")
+            return self._ensure_execution_prefix(tunnel_url)
         except Exception as e:
             raise RuntimeError(
                 f"Execution API URL not configured and tunnel creation failed: {e}. "
@@ -331,6 +337,20 @@ class ModalExecutor(BaseExecutor):
             raise ValueError(
                 f"Execution API URL must start with http:// or https://: {url}"
             )
+
+    @staticmethod
+    def _ensure_execution_prefix(url: str) -> str:
+        """Ensure the URL ends with ``/execution/``.
+
+        The Airflow task SDK uses *relative* paths (e.g.
+        ``task-instances/{id}/run``) against the base URL.  If the URL
+        doesn't include the ``/execution/`` path, requests hit the REST
+        API instead of the execution API, producing 405 errors.
+        """
+        stripped = url.rstrip("/")
+        if not stripped.endswith("/execution"):
+            stripped += "/execution"
+        return stripped + "/"
 
     def _get_task_env(self, key: TaskInstanceKey, executor_config: Any) -> Dict[str, str]:
         """

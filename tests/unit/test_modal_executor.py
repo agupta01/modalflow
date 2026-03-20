@@ -6,6 +6,7 @@ import unittest
 # This allows running tests without installing heavy airflow dependencies
 mock_airflow = mock.MagicMock()
 sys.modules["airflow"] = mock_airflow
+sys.modules["airflow.configuration"] = mock_airflow.configuration
 sys.modules["airflow.executors"] = mock_airflow.executors
 sys.modules["airflow.executors.base_executor"] = mock_airflow.executors.base_executor
 sys.modules["airflow.models"] = mock_airflow.models

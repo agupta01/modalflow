@@ -17,13 +17,16 @@ DAGS_VOLUME_NAME = os.environ.get("MODALFLOW_DAGS_VOLUME", None)  # volume mode
 DAGS_BUCKET = os.environ.get("MODALFLOW_DAGS_BUCKET", None)       # cloud-bucket mode
 DAGS_BUCKET_SECRET = os.environ.get("MODALFLOW_DAGS_BUCKET_SECRET", None)
 
+# Airflow version to install (configurable via CLI --airflow-version flag)
+AIRFLOW_VERSION = os.environ.get("MODALFLOW_AIRFLOW_VERSION", "3.1.5")
+
 # Define the base image
 # We use the official Airflow image to ensure compatibility.
-# Upgrade from 3.0.6 to 3.1.5 (3.0.6 lacks queue_workload support).
+# Upgrade from 3.0.6 to 3.1.x+ (3.0.6 lacks queue_workload support).
 airflow_image = (
     modal.Image.from_registry("apache/airflow:3.0.6-python3.10")
     .run_commands(
-        'su -s /bin/bash airflow -c "pip install apache-airflow==3.1.5"'
+        f'su -s /bin/bash airflow -c "pip install apache-airflow=={AIRFLOW_VERSION}"'
     )
     .pip_install(
         "modal",
@@ -199,8 +202,8 @@ def execute_modal_task(payload: dict):
 
         # Log output to Modal's centralized logging
         print(f"Return code: {result.returncode}")
-        print(f"STDOUT (first 500): {result.stdout[:500]}")
-        print(f"STDERR (first 500): {result.stderr[:500]}")
+        print(f"STDOUT:\n{result.stdout}")
+        print(f"STDERR:\n{result.stderr}")
 
         # Write output to the log file on the volume
         if log_file_path:
