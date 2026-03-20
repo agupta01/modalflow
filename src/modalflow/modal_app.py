@@ -121,6 +121,16 @@ def execute_modal_task(payload: dict):
     cli_command = payload.get("command")
     env_vars = payload.get("env", {})
 
+    # Extract log_path from workload so we can read the structured log file
+    # written by the Airflow SDK supervisor after execution.
+    log_path = None
+    if workload_json:
+        try:
+            workload_data = json.loads(workload_json)
+            log_path = workload_data.get("log_path")
+        except Exception:
+            pass
+
     print(f"Starting execution for {task_key}")
 
     if workload_json:
@@ -149,39 +159,6 @@ def execute_modal_task(payload: dict):
     run_env = os.environ.copy()
     run_env.update(env_vars)
 
-    # Try to extract task info for logging
-    log_file_path = None
-    try:
-        if workload_json:
-            workload_data = json.loads(workload_json)
-            ti = workload_data.get("ti", {})
-            dag_id = ti.get("dag_id", "unknown")
-            task_id = ti.get("task_id", "unknown")
-            run_id = ti.get("run_id", "unknown")
-            try_number = ti.get("try_number", 1)
-        elif cli_command and len(cli_command) >= 6:
-            # Parse from CLI args: airflow tasks run dag_id task_id run_id ...
-            dag_id = cli_command[3]
-            task_id = cli_command[4]
-            run_id = cli_command[5]
-            try_number = 1
-        else:
-            dag_id = task_id = run_id = "unknown"
-            try_number = 1
-
-        # Construct path: /opt/airflow/logs/dag_id/task_id/run_id/try_number.log
-        log_dir = os.path.join(
-            "/opt/airflow/logs",
-            f"dag_id={dag_id}",
-            f"run_id={run_id}",
-            f"task_id={task_id}",
-        )
-        os.makedirs(log_dir, exist_ok=True)
-        log_file_path = os.path.join(log_dir, f"attempt={try_number}.log")
-        print(f"Writing logs to {log_file_path}")
-    except Exception as e:
-        print(f"Warning: Failed to setup log directory structure: {e}")
-
     # Update state to RUNNING right before execution
     state_dict[task_key] = {
         "status": "RUNNING",
@@ -205,22 +182,28 @@ def execute_modal_task(payload: dict):
         print(f"STDOUT:\n{result.stdout}")
         print(f"STDERR:\n{result.stderr}")
 
-        # Write output to the log file on the volume
-        if log_file_path:
-            try:
-                with open(log_file_path, "w") as f:
-                    f.write(f"*** STDOUT ***\n{result.stdout}\n")
-                    f.write(f"*** STDERR ***\n{result.stderr}\n")
-            except Exception as e:
-                print(f"Failed to write log file: {e}")
-
         status = "SUCCESS" if result.returncode == 0 else "FAILED"
+
+        # Try to read the structured log file written by the Airflow SDK
+        # supervisor.  This contains properly formatted task logs.
+        log_content = ""
+        if log_path:
+            log_file = os.path.join("/opt/airflow/logs", log_path)
+            try:
+                with open(log_file) as f:
+                    log_content = f.read()
+                print(f"Read {len(log_content)} bytes from {log_file}")
+            except FileNotFoundError:
+                print(f"Log file not found at {log_file}, will use stdout")
+            except Exception as e:
+                print(f"Failed to read log file {log_file}: {e}")
 
         state_dict[task_key] = {
             "status": status,
             "return_code": result.returncode,
-            "stdout": result.stdout[-2000:],  # Store last 2KB for quick debug
+            "stdout": result.stdout,
             "stderr": result.stderr[-2000:],
+            "log_content": log_content,
         }
 
     except Exception as e:

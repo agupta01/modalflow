@@ -42,6 +42,9 @@ airflow_test_image = (
 app = modal.App("modalflow-test-runner", image=airflow_test_image)
 
 
+log_volume = modal.Volume.from_name("airflow-logs-main", create_if_missing=True)
+
+
 def create_test_sandbox() -> modal.Sandbox:
     """
     Create a Sandbox for running airflow standalone tests.
@@ -59,6 +62,7 @@ def create_test_sandbox() -> modal.Sandbox:
         image=airflow_test_image,
         secrets=[modal.Secret.from_name("modal")],
         encrypted_ports=[8080],
+        volumes={"/opt/airflow/logs": log_volume},
         name="modalflow-system-runner",
         timeout=3600,
     )
@@ -89,7 +93,7 @@ def start_airflow(sandbox: modal.Sandbox) -> None:
 # E2E test classes (run via pytest)
 # ---------------------------------------------------------------------------
 
-from helpers import unpause_dag, trigger_dag, wait_for_dag_run, get_task_states
+from helpers import unpause_dag, trigger_dag, wait_for_dag_run, get_task_states, get_task_logs
 
 
 class TestBashOperatorE2E:
@@ -106,6 +110,11 @@ class TestBashOperatorE2E:
             for t in tasks
         ), f"echo_hello task not successful: {tasks}"
 
+        # Verify logs are readable via the REST API (same path the UI uses)
+        logs = get_task_logs(sandbox, dag_id, run_id, "echo_hello")
+        assert "Could not read served logs" not in logs, f"Log serving broken: {logs[:500]}"
+        assert len(logs) > 0, "Logs should not be empty"
+
 
 class TestPythonOperatorE2E:
     def test_python_task_succeeds(self, airflow_ready, sandbox):
@@ -121,6 +130,11 @@ class TestPythonOperatorE2E:
             for t in tasks
         ), f"return_value task not successful: {tasks}"
 
+        # Verify logs are readable via the REST API
+        logs = get_task_logs(sandbox, dag_id, run_id, "return_value")
+        assert "Could not read served logs" not in logs, f"Log serving broken: {logs[:500]}"
+        assert len(logs) > 0, "Logs should not be empty"
+
 
 class TestFailurePropagation:
     def test_failing_task_reported(self, airflow_ready, sandbox):
@@ -135,6 +149,11 @@ class TestFailurePropagation:
             t["task_id"] == "fail_task" and t["state"] == "failed"
             for t in tasks
         ), f"fail_task task not failed: {tasks}"
+
+        # Verify logs are readable even for failed tasks
+        logs = get_task_logs(sandbox, dag_id, run_id, "fail_task")
+        assert "Could not read served logs" not in logs, f"Log serving broken: {logs[:500]}"
+        assert len(logs) > 0, "Logs should not be empty"
 
 
 if __name__ == "__main__":
