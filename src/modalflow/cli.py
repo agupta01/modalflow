@@ -38,7 +38,13 @@ def cli():
     "--dags-bucket-secret",
     help="Modal Secret name with cloud credentials (required for cloud-bucket mode)",
 )
-def deploy(env, dags_source, dags_path, dags_volume, dags_bucket, dags_bucket_secret):
+@click.option(
+    "--airflow-version",
+    default="3.1.5",
+    show_default=True,
+    help="Apache Airflow version to install in the Modal function image",
+)
+def deploy(env, dags_source, dags_path, dags_volume, dags_bucket, dags_bucket_secret, airflow_version):
     """
     Deploy the Modalflow application to the specified environment.
 
@@ -66,6 +72,7 @@ def deploy(env, dags_source, dags_path, dags_volume, dags_bucket, dags_bucket_se
     # Build environment variables for modal deploy
     env_vars = os.environ.copy()
     env_vars["MODALFLOW_ENV"] = env
+    env_vars["MODALFLOW_AIRFLOW_VERSION"] = airflow_version
 
     if dags_source == "local":
         env_vars["MODALFLOW_DAGS_DIR"] = dags_path
