@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 from urllib.parse import urljoin
 
@@ -12,6 +14,7 @@ from airflow.models.taskinstance import TaskInstanceKey
 
 if TYPE_CHECKING:
     from airflow.executors.workloads import All as ExecutorWorkload
+    from airflow.models.taskinstance import TaskInstance
 
 # Type alias for command - can be a list containing a workload or list of strings
 CommandType = Union[List[executor_workloads.ExecuteTask], List[str]]
@@ -212,11 +215,13 @@ class ModalExecutor(BaseExecutor):
             status = task_state.get("status")
 
             if status == "SUCCESS":
+                self._write_task_log(task_state, key)
                 self.success(key)
                 completed_keys.append(task_key_str)
                 self.log.info(f"Task {task_key_str} succeeded")
 
             elif status == "FAILED":
+                self._write_task_log(task_state, key)
                 self.fail(key)
                 completed_keys.append(task_key_str)
                 error_msg = task_state.get("error", "Unknown error")
@@ -234,6 +239,63 @@ class ModalExecutor(BaseExecutor):
                 self._state_dict.pop(k)
             except Exception as e:
                 self.log.warning(f"Failed to cleanup remote state for {k}: {e}") 
+
+    def get_task_log(self, ti: TaskInstance, try_number: int) -> tuple[list[str], list[str]]:
+        """Return partial logs from state_dict for running tasks.
+
+        Called by FileTaskHandler when ti.state == RUNNING.  Once the task
+        completes, full logs are read from the local filesystem (written by
+        ``_write_task_log`` during ``sync()``).
+        """
+        task_key_str = self._get_key_str(ti.key)
+        try:
+            task_state = self._state_dict.get(task_key_str)
+        except Exception:
+            return [], []
+        if task_state and task_state.get("stdout"):
+            return (
+                [f"Modal task output for {task_key_str}"],
+                [task_state["stdout"]],
+            )
+        return [f"Task {task_key_str} running on Modal"], ["Waiting for output..."]
+
+    def _write_task_log(self, task_state: dict, key: TaskInstanceKey) -> None:
+        """Write task log content from state_dict to the local base_log_folder.
+
+        This makes ``FileTaskHandler._read_from_local()`` work for completed
+        tasks even when the Airflow scheduler doesn't share a Modal Volume
+        with the Modal Functions (e.g. local / production deployments).
+        """
+        # Prefer structured log content from the Airflow SDK supervisor,
+        # fall back to raw stdout captured from the subprocess.
+        content = task_state.get("log_content") or task_state.get("stdout") or ""
+        if not content:
+            return
+
+        try:
+            base_log_folder = conf.get("logging", "base_log_folder")
+        except Exception:
+            base_log_folder = "/opt/airflow/logs"
+
+        # Construct the log path to match FileTaskHandler's default template:
+        #   dag_id={dag_id}/run_id={run_id}/task_id={task_id}/attempt={try_number}.log
+        parts = [
+            f"dag_id={key.dag_id}",
+            f"run_id={key.run_id}",
+            f"task_id={key.task_id}",
+        ]
+        if key.map_index >= 0:
+            parts.append(f"map_index={key.map_index}")
+        parts.append(f"attempt={key.try_number}.log")
+        log_rel_path = os.path.join(*parts)
+
+        full_path = Path(base_log_folder) / log_rel_path
+        try:
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_text(content)
+            self.log.info(f"Wrote task log ({len(content)} bytes) to {full_path}")
+        except Exception as e:
+            self.log.warning(f"Failed to write task log to {full_path}: {e}")
 
     def end(self) -> None:
         """
@@ -263,11 +325,15 @@ class ModalExecutor(BaseExecutor):
     def _get_key_str(self, key: TaskInstanceKey) -> str:
         """
         Serialize TaskInstanceKey to a string.
-        Format: dag_id:task_id:run_id:try_number
+        Format: dag_id:task_id:run_id:try_number[:map_index]
+
+        map_index is included only for mapped tasks (>= 0) to avoid
+        collisions in state_dict and active_tasks.
         """
-        # Note: TaskInstanceKey is a named tuple, but the fields vary slightly by Airflow version
-        # We construct a stable string key
-        return f"{key.dag_id}:{key.task_id}:{key.run_id}:{key.try_number}"
+        base = f"{key.dag_id}:{key.task_id}:{key.run_id}:{key.try_number}"
+        if key.map_index >= 0:
+            return f"{base}:{key.map_index}"
+        return base
 
     def _resolve_execution_api_url(self) -> str:
         """

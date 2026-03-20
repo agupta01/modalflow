@@ -28,6 +28,12 @@ def start_airflow_and_wait_ready(sandbox: modal.Sandbox, timeout: int = 180) -> 
     execution_api_url = f"{tunnel_url}/execution/"
     print(f"Execution API tunnel URL: {execution_api_url}")
 
+    # Fix permissions on the volume-mounted logs directory so the airflow user
+    # (uid 50000) can write dag-processor and task logs.  Modal FUSE volumes
+    # don't support chown, but chmod 777 makes the directory world-writable.
+    chmod_proc = sandbox.exec("chmod", "777", "/opt/airflow/logs")
+    chmod_proc.wait()
+
     # Start airflow standalone as a foreground exec.  We tee output to a log
     # file so we can grep it for the readiness signal, while still keeping
     # the exec's stdout pipe alive (Modal uses active pipe I/O to determine
@@ -46,6 +52,16 @@ def start_airflow_and_wait_ready(sandbox: modal.Sandbox, timeout: int = 180) -> 
     def _drain():
         for line in _airflow_proc.stdout:
             print(line, end="")
+            # Capture admin password from "Password for user 'admin': <pw>"
+            if "Password for user" in line and "admin" in line:
+                parts = line.strip().rsplit(":", 1)
+                if len(parts) == 2:
+                    pw = parts[1].strip()
+                    # Write to a known location so get_task_logs() can read it
+                    pw_proc = sandbox.exec(
+                        "bash", "-c", f"echo '{pw}' > /tmp/admin_password.txt",
+                    )
+                    pw_proc.wait()
             if "Airflow is ready" in line:
                 ready_event.set()
 
@@ -216,6 +232,47 @@ def wait_for_dag_run(
     raise TimeoutError(
         f"DAG run {dag_id}/{run_id} did not complete within {timeout}s"
     )
+
+
+def get_task_logs(
+    sandbox: modal.Sandbox,
+    dag_id: str,
+    run_id: str,
+    task_id: str,
+    try_number: int = 1,
+) -> str:
+    """Fetch task logs via the Airflow REST API (same endpoint the UI uses).
+
+    Returns:
+        The log content string.
+
+    Raises:
+        RuntimeError: If the API call fails.
+    """
+    # Read the admin password saved during start_airflow_and_wait_ready()
+    proc = sandbox.exec("bash", "-c", "cat /tmp/admin_password.txt 2>/dev/null || echo ''")
+    password = ""
+    for line in proc.stdout:
+        password = line.strip()
+    proc.wait()
+
+    if not password:
+        raise RuntimeError("Could not read standalone admin password")
+
+    api_url = (
+        f"http://localhost:8080/api/v2/dags/{dag_id}/dagRuns/{run_id}"
+        f"/taskInstances/{task_id}/logs/{try_number}"
+    )
+    proc = sandbox.exec(
+        "bash", "-c",
+        f'curl -s -u "admin:{password}" "{api_url}"',
+    )
+    lines = []
+    for line in proc.stdout:
+        lines.append(line)
+    proc.wait()
+
+    return "".join(lines)
 
 
 def get_task_states(
