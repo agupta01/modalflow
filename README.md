@@ -1,8 +1,8 @@
 # Modalflow
 
-A serverless Airflow executor that runs tasks as [Modal](https://modal.com) Functions.
+A serverless Airflow executor that runs each task as an independent [Modal](https://modal.com) Sandbox.
 
-Modalflow replaces Airflow's built-in executors (Local, Celery, Kubernetes) with one that dispatches each task to a Modal Function. No worker pools, no Kubernetes cluster, no infrastructure to manage — tasks run on-demand and scale to zero when idle.
+Modalflow replaces Airflow's built-in executors (Local, Celery, Kubernetes) with one that dispatches each task to its own Modal Sandbox. No worker pools, no Kubernetes cluster, no infrastructure to manage — tasks run on-demand and scale to zero when idle.
 
 ## Prerequisites
 
@@ -14,45 +14,35 @@ Modalflow replaces Airflow's built-in executors (Local, Celery, Kubernetes) with
 
 ### 1. Install
 
-Install `modalflow` on both your **local machine** (for the CLI) and your **Airflow cluster** (for the executor):
+Install `modalflow` on the machine running Airflow (the scheduler that hosts the executor):
 
 ```bash
 pip install modalflow
 ```
 
-### 2. Deploy the Modal backend
+The same install provides the `modalflow` CLI used to push DAGs.
 
-The `modalflow deploy` command creates the Modal Function, Volume, and Dict that the executor needs. You must choose how DAG files are provided to the Modal task workers:
+### 2. Configure the Modal CLI
 
-**Local mode** — bakes DAGs into the function image (simplest, but requires redeploying on every DAG change):
-
-```bash
-modalflow deploy --dags-source local --dags-path ./dags
-```
-
-**Volume mode** — stores DAGs on a Modal Volume (update DAGs without redeploying):
+If you haven't already, authenticate the Modal CLI on the machine running Airflow:
 
 ```bash
-modalflow deploy --dags-source volume --dags-volume my-dags --dags-path ./dags
+modal setup
 ```
 
-**Cloud bucket mode** — reads DAGs from an S3 bucket at runtime:
+The executor uses your Modal credentials to create a sandbox per task.
+
+### 3. Push your DAGs to a Modal Volume
+
+DAGs are delivered via a Modal Volume. Each task sandbox mounts this volume at `/opt/airflow/dags`. Push your DAG directory with `modalflow sync`:
 
 ```bash
-modalflow deploy --dags-source cloud-bucket \
-  --dags-bucket s3://my-bucket/dags \
-  --dags-bucket-secret my-aws-secret
+modalflow sync --dags-path ./dags --dags-volume my-dags
 ```
 
-By default, the Modal function image installs Airflow 3.1.5. To match your local Airflow version, use `--airflow-version`:
+This does a full replace — files deleted locally are also removed from the volume. Re-run it whenever your DAGs change (see [Updating DAGs](#updating-dags)).
 
-```bash
-modalflow deploy --dags-source local --dags-path ./dags --airflow-version 3.1.8
-```
-
-To target a specific Modal environment, add `--env <name>` (default: `main`).
-
-### 3. Configure Airflow
+### 4. Configure Airflow
 
 Set the executor class in `airflow.cfg` or via environment variable:
 
@@ -65,21 +55,35 @@ executor = modalflow.executor.ModalExecutor
 export AIRFLOW__CORE__EXECUTOR=modalflow.executor.ModalExecutor
 ```
 
-The executor reads `MODALFLOW_ENV` to find the right Modal app (default: `main`). Set it if you deployed with a custom `--env`.
+Then tell the executor which volume to mount into each task sandbox:
 
-## Updating DAGs (volume mode)
+```bash
+export MODALFLOW_DAGS_VOLUME=my-dags
+```
 
-With volume mode, use `modalflow sync` to push DAG changes without redeploying the function:
+Optional settings:
+
+- `MODALFLOW_ENV` — target Modal environment name (default: `main`).
+- `MODALFLOW_AIRFLOW_VERSION` — Apache Airflow version installed in each task sandbox (default: `3.1.5`). Set this to match your Airflow server version to avoid API version mismatches between the task SDK in the sandbox and your Airflow server.
+
+```bash
+export MODALFLOW_ENV=main
+export MODALFLOW_AIRFLOW_VERSION=3.1.8
+```
+
+## Updating DAGs
+
+`modalflow sync` is the primary mechanism for delivering DAG changes. Re-run it whenever you add, edit, or remove DAGs:
 
 ```bash
 modalflow sync --dags-path ./dags --dags-volume my-dags
 ```
 
-This does a full replace — files deleted locally are also removed from the volume.
+This performs a full replace — files deleted locally are also removed from the volume, so the volume always mirrors your local DAG directory. New sandboxes pick up the latest DAGs automatically; there is no backend to redeploy.
 
 ## Networking
 
-Modal Functions run in Modal's cloud. To execute a task, the function must call back to your Airflow deployment's [execution API](https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/execution-api.html). This means Airflow's API server must be reachable from the public internet.
+Task sandboxes run in Modal's cloud. To execute a task, the sandbox must call back to your Airflow deployment's [execution API](https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/execution-api.html). This means Airflow's API server must be reachable from the public internet.
 
 The executor resolves the execution API URL in priority order:
 
@@ -104,7 +108,7 @@ Common ways to expose the API:
 
 ### Local development
 
-When running Airflow locally (e.g. `airflow standalone`), Modal functions need to reach your local execution API. Use a reverse tunnel (ngrok, Cloudflare Tunnel, etc.) and set the URL:
+When running Airflow locally (e.g. `airflow standalone`), task sandboxes need to reach your local execution API. Use a reverse tunnel (ngrok, Cloudflare Tunnel, etc.) and set the URL:
 
 ```bash
 export AIRFLOW__CORE__EXECUTION_API_SERVER_URL=https://your-tunnel-url.ngrok-free.app/execution/
@@ -112,19 +116,21 @@ export AIRFLOW__CORE__EXECUTION_API_SERVER_URL=https://your-tunnel-url.ngrok-fre
 
 See `.env.example` for a full local development template.
 
-**Important:** deploy with `--airflow-version` matching your local Airflow version to avoid API version mismatches between the SDK on Modal and your local Airflow server:
+**Important:** set `MODALFLOW_AIRFLOW_VERSION` to match your local Airflow version to avoid API version mismatches between the task SDK in the sandbox and your local Airflow server:
 
 ```bash
-modalflow deploy --dags-source local --dags-path ./dags --airflow-version 3.1.8
+export MODALFLOW_AIRFLOW_VERSION=3.1.8
 ```
 
-> **Note:** Only DAGs you deploy to Modal (via `--dags-path`) are available to task workers. Airflow's built-in example DAGs use a separate bundle (`example_dags`) that isn't present on Modal, so they will fail. Use your own DAGs.
+> **Note:** Only DAGs you push to the volume (via `modalflow sync`) are available to task sandboxes. Airflow's built-in example DAGs use a separate bundle (`example_dags`) that isn't present in the sandbox, so they will fail. Use your own DAGs.
 
 ## Development
 
 ```bash
 uv sync --extra dev
-uv run modalflow deploy --help
+uv run modalflow sync --help
 uv run pytest                      # unit tests
 make system.setup && make system.test.e2e   # E2E tests (requires Modal)
 ```
+
+`make system.setup` builds the package and pushes the test DAGs to a Modal Volume; `make system.test.e2e` runs `airflow standalone` inside a Modal Sandbox and exercises the executor end-to-end.
