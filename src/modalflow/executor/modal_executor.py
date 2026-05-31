@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
-from urllib.parse import urljoin
 
 import modal
 from airflow.configuration import conf
 from airflow.executors.base_executor import BaseExecutor
 from airflow.executors import workloads as executor_workloads
 from airflow.models.taskinstance import TaskInstanceKey
+
+from modalflow import modal_app
 
 if TYPE_CHECKING:
     from airflow.executors.workloads import All as ExecutorWorkload
@@ -26,7 +28,7 @@ CONCURRENCY_LIMIT = 100
 
 class ModalExecutor(BaseExecutor):
     """
-    An Airflow Executor that runs tasks as Modal Functions.
+    An Airflow Executor that runs each task as an independent Modal Sandbox.
     """
 
     is_local: bool = True
@@ -34,12 +36,14 @@ class ModalExecutor(BaseExecutor):
     def __init__(self):
         # Use the same concurrency limit as the Modal function
         super().__init__(parallelism=CONCURRENCY_LIMIT)
-        self.active_tasks: Dict[str, TaskInstanceKey] = {}
+        # Maps task_key_str -> handle dict:
+        #   {"key": TaskInstanceKey, "sandbox": Sandbox,
+        #    "process": ContainerProcess, "log_path": str | None}
+        self.active_tasks: Dict[str, Dict[str, Any]] = {}
         # These will be initialized in start()
-        self._modal_function = None
-        self._state_dict = None
-        self._tunnel_context = None  # Store the context manager
-        self._tunnel = None  # Store the tunnel object from __enter__()
+        self._app = None
+        self._image = None
+        self._volumes = None
         self._execution_api_url = None
 
     @property
@@ -52,36 +56,30 @@ class ModalExecutor(BaseExecutor):
 
     def start(self):
         """
-        Initialize the executor by looking up the deployed Modal function and state dict.
-        Also sets up networking (tunnel for local or production URL).
+        Initialize the executor by building the task image, resolving the
+        DAG + log volumes, and looking up (or creating) the Modal App that
+        owns the per-task sandboxes.
+
+        No deployed function or state dict is required — each task runs as
+        an independent Modal Sandbox created on demand by ``execute_async``.
         """
         self.log.info("Starting ModalExecutor")
 
-        app_name = f"modalflow-{ENV}"
-        dict_name = f"airflow-state-{ENV}"
-
-        # Look up the deployed Modal function
+        # Build the task image and resolve volumes via the builder module.
         try:
-            self._modal_function = modal.Function.from_name(
-                app_name, "execute_modal_task"
+            self._app = modal.App.lookup(modal_app.APP_NAME, create_if_missing=True)
+            self._image = modal_app.build_task_image()
+            self._volumes = modal_app.resolve_volumes()
+            self.log.info(
+                f"ModalExecutor ready: app={modal_app.APP_NAME}, "
+                f"volumes={list(self._volumes.keys())}"
             )
-            self.log.info(f"Connected to Modal function: {app_name}/execute_modal_task")
         except Exception as e:
-            self.log.error(
-                f"Failed to look up Modal function {app_name}/execute_modal_task: {e}"
-            )
-            raise
-
-        # Look up the state dictionary
-        try:
-            self._state_dict = modal.Dict.from_name(dict_name)
-            self.log.info(f"Connected to Modal Dict: {dict_name}")
-        except Exception as e:
-            self.log.error(f"Failed to connect to Modal Dict {dict_name}: {e}")
+            self.log.error(f"Failed to initialize Modal resources: {e}")
             raise
 
         # Set up execution API URL.
-        # Priority: env var > Airflow config > modal.forward() tunnel > error
+        # Priority: env var > Airflow config > error
         self._execution_api_url = self._resolve_execution_api_url()
         self.log.info(f"Execution API URL: {self._execution_api_url}")
 
@@ -93,47 +91,69 @@ class ModalExecutor(BaseExecutor):
         executor_config: Optional[Any] = None,
     ) -> None:
         """
-        Trigger a task execution on Modal.
+        Trigger a task execution by creating a Modal Sandbox.
 
         Handles two formats:
         - New-style: command is a list containing an ExecuteTask workload object.
-        - Old-style: command is a list of strings (CLI command).
+          The sandbox runs ``python -m airflow.sdk.execution_time.execute_workload``.
+        - Old-style: command is a list of strings (CLI command), run directly.
         """
         task_key_str = self._get_key_str(key)
-
-        if len(command) == 1 and isinstance(command[0], executor_workloads.ExecuteTask):
-            # New-style: serialize the workload to JSON
-            workload = command[0]
-            serialized_workload = workload.model_dump_json()
-            payload = {
-                "task_key": task_key_str,
-                "workload_json": serialized_workload,
-                "env": self._get_task_env(key, executor_config),
-            }
-        elif all(isinstance(c, str) for c in command):
-            # Old-style: pass the CLI command for direct execution
-            payload = {
-                "task_key": task_key_str,
-                "command": command,
-                "env": self._get_task_env(key, executor_config),
-            }
-        else:
-            raise RuntimeError(
-                f"ModalExecutor doesn't know how to handle command of type: {type(command)}"
-            )
-
-        self.log.info(f"Spawning Modal task for {task_key_str}")
 
         if self._execution_api_url is None:
             raise RuntimeError(
                 "Execution API URL not configured. Ensure start() was called successfully."
             )
 
+        log_path = None
+
+        if len(command) == 1 and isinstance(command[0], executor_workloads.ExecuteTask):
+            # New-style: serialize the workload to JSON and run via the SDK.
+            workload = command[0]
+            workload_json = workload.model_dump_json()
+            try:
+                log_path = json.loads(workload_json).get("log_path")
+            except Exception:
+                log_path = None
+            sandbox_command = [
+                "python",
+                "-m",
+                "airflow.sdk.execution_time.execute_workload",
+                "--json-string",
+                workload_json,
+            ]
+        elif all(isinstance(c, str) for c in command):
+            # Old-style: run the CLI command directly.
+            sandbox_command = list(command)
+        else:
+            raise RuntimeError(
+                f"ModalExecutor doesn't know how to handle command of type: {type(command)}"
+            )
+
+        self.log.info(f"Creating Modal sandbox for {task_key_str}")
+
+        task_env = self._get_task_env(key, executor_config)
+
         try:
-            self._modal_function.spawn(payload)
-            self.active_tasks[task_key_str] = key
+            # Create an idle (sleep infinity) sandbox, then run the task as
+            # an exec'd process inside it.  This keeps the sandbox alive after
+            # the task exits so we can read the structured log file before
+            # terminating it.
+            sb = modal_app.create_task_sandbox(
+                app=self._app,
+                image=self._image,
+                volumes=self._volumes,
+                env=task_env,
+            )
+            proc = sb.exec(*sandbox_command, env=task_env)
+            self.active_tasks[task_key_str] = {
+                "key": key,
+                "sandbox": sb,
+                "process": proc,
+                "log_path": log_path,
+            }
         except Exception as e:
-            self.log.error(f"Failed to spawn Modal task: {e}")
+            self.log.error(f"Failed to create Modal sandbox: {e}")
             self.fail(key)
 
     def _process_workloads(self, workloads: Sequence) -> None:
@@ -188,87 +208,109 @@ class ModalExecutor(BaseExecutor):
 
     def sync(self) -> None:
         """
-        Check the status of running tasks.
+        Poll each tracked sandbox for completion (non-blocking).
+
+        For each task whose sandbox process has finished, read the
+        structured log file out of the sandbox (before terminating it),
+        write it to the local log folder, report success/failure based on
+        the return code, terminate the sandbox, and stop tracking it.
         """
         if not self.active_tasks:
             return
 
-        # Poll the state dictionary
-        # TODO: batch this or use a more efficient lookup
-
         completed_keys = []
 
-        for task_key_str, key in self.active_tasks.items():
-            # Check if this key exists in the remote dict
-            # We use .get() to avoid errors if key is missing
+        for task_key_str, handle in self.active_tasks.items():
+            key = handle["key"]
+            proc = handle["process"]
+            sb = handle["sandbox"]
+            log_path = handle.get("log_path")
+
+            # poll() returns None while running, else the exit code.
             try:
-                task_state = self._state_dict.get(task_key_str)
+                return_code = proc.poll()
             except Exception as e:
-                self.log.warning(f"Error reading state for {task_key_str}: {e}")
+                self.log.warning(f"Error polling sandbox for {task_key_str}: {e}")
                 continue
 
-            if not task_state:
-                # Task not yet registered by worker, or lost
-                # TODO: implement a timeout logic here
+            if return_code is None:
+                # Still running.
                 continue
 
-            status = task_state.get("status")
+            # Read the structured log file out of the sandbox BEFORE
+            # terminating it, so logs are available locally.
+            log_content = self._read_sandbox_log(sb, log_path)
+            if log_content:
+                self._write_task_log(log_content, key)
 
-            if status == "SUCCESS":
-                self._write_task_log(task_state, key)
+            if return_code == 0:
                 self.success(key)
-                completed_keys.append(task_key_str)
                 self.log.info(f"Task {task_key_str} succeeded")
-
-            elif status == "FAILED":
-                self._write_task_log(task_state, key)
+            else:
                 self.fail(key)
-                completed_keys.append(task_key_str)
-                error_msg = task_state.get("error", "Unknown error")
-                self.log.error(f"Task {task_key_str} failed: {error_msg}")
-                if task_state.get("stderr"):
-                    self.log.error(f"Task {task_key_str} stderr: {task_state['stderr']}")
-                if task_state.get("stdout"):
-                    self.log.info(f"Task {task_key_str} stdout: {task_state['stdout']}")
+                self.log.error(
+                    f"Task {task_key_str} failed (return code {return_code})"
+                )
 
-        # Cleanup local state
+            # Terminate the sandbox to release resources.
+            try:
+                sb.terminate()
+            except Exception as e:
+                self.log.warning(f"Failed to terminate sandbox for {task_key_str}: {e}")
+
+            completed_keys.append(task_key_str)
+
         for k in completed_keys:
             del self.active_tasks[k]
-            # Cleanup remote state
-            try:
-                self._state_dict.pop(k)
-            except Exception as e:
-                self.log.warning(f"Failed to cleanup remote state for {k}: {e}") 
+
+    def _read_sandbox_log(self, sandbox, log_path: Optional[str]) -> str:
+        """Read the structured log file from a (still-running) sandbox.
+
+        Returns the file contents, or an empty string if unavailable.
+        """
+        if not log_path:
+            return ""
+
+        log_file = os.path.join("/opt/airflow/logs", log_path)
+        try:
+            proc = sandbox.exec("cat", log_file)
+            content = proc.stdout.read()
+            proc.wait()
+            if proc.returncode != 0:
+                return ""
+            return content or ""
+        except Exception as e:
+            self.log.warning(f"Failed to read log file {log_file} from sandbox: {e}")
+            return ""
 
     def get_task_log(self, ti: TaskInstance, try_number: int) -> tuple[list[str], list[str]]:
-        """Return partial logs from state_dict for running tasks.
+        """Return partial logs from the live sandbox for running tasks.
 
-        Called by FileTaskHandler when ti.state == RUNNING.  Once the task
-        completes, full logs are read from the local filesystem (written by
-        ``_write_task_log`` during ``sync()``).
+        Called by FileTaskHandler when ti.state == RUNNING.  Reads the
+        in-progress structured log file directly from the running sandbox.
+        Once the task completes, full logs are read from the local
+        filesystem (written by ``_write_task_log`` during ``sync()``).
         """
         task_key_str = self._get_key_str(ti.key)
-        try:
-            task_state = self._state_dict.get(task_key_str)
-        except Exception:
+        handle = self.active_tasks.get(task_key_str)
+        if not handle:
             return [], []
-        if task_state and task_state.get("stdout"):
+
+        content = self._read_sandbox_log(handle["sandbox"], handle.get("log_path"))
+        if content:
             return (
                 [f"Modal task output for {task_key_str}"],
-                [task_state["stdout"]],
+                [content],
             )
         return [f"Task {task_key_str} running on Modal"], ["Waiting for output..."]
 
-    def _write_task_log(self, task_state: dict, key: TaskInstanceKey) -> None:
-        """Write task log content from state_dict to the local base_log_folder.
+    def _write_task_log(self, content: str, key: TaskInstanceKey) -> None:
+        """Write task log content to the local base_log_folder.
 
         This makes ``FileTaskHandler._read_from_local()`` work for completed
         tasks even when the Airflow scheduler doesn't share a Modal Volume
-        with the Modal Functions (e.g. local / production deployments).
+        with the task sandboxes (e.g. local / production deployments).
         """
-        # Prefer structured log content from the Airflow SDK supervisor,
-        # fall back to raw stdout captured from the subprocess.
-        content = task_state.get("log_content") or task_state.get("stdout") or ""
         if not content:
             return
 
@@ -300,21 +342,21 @@ class ModalExecutor(BaseExecutor):
     def end(self) -> None:
         """
         Terminate the executor and cleanup resources.
+
+        Terminates any sandboxes that are still tracked (e.g. on shutdown
+        while tasks are mid-flight).
         """
         self.log.info("Shutting down ModalExecutor")
         self.heartbeat_interval = 0
 
-        # Cleanup tunnel if it exists
-        if self._tunnel_context is not None:
+        for task_key_str, handle in list(self.active_tasks.items()):
             try:
-                # Exit the context manager
-                self._tunnel_context.__exit__(None, None, None)
-                self.log.info("Closed tunnel")
+                handle["sandbox"].terminate()
             except Exception as e:
-                self.log.warning(f"Error closing tunnel: {e}")
-            finally:
-                self._tunnel_context = None
-                self._tunnel = None
+                self.log.warning(
+                    f"Failed to terminate sandbox for {task_key_str}: {e}"
+                )
+        self.active_tasks.clear()
 
     def terminate(self) -> None:
         """
@@ -342,7 +384,6 @@ class ModalExecutor(BaseExecutor):
         Priority:
         1. Environment variable AIRFLOW__CORE__EXECUTION_API_SERVER_URL
         2. Airflow config: core.execution_api_server_url
-        3. modal.forward() tunnel (only works inside Modal Functions)
 
         The URL must end with ``/execution/`` because the Airflow task SDK
         uses relative paths (e.g. ``task-instances/{id}/run``).  If the
@@ -371,20 +412,11 @@ class ModalExecutor(BaseExecutor):
         except Exception as e:
             self.log.warning(f"Error reading execution_api_server_url from config: {e}")
 
-        # 3. Try modal.forward() tunnel (works inside Modal Functions only)
-        self.log.info(
-            "No execution API URL configured, attempting modal.forward() tunnel"
+        raise RuntimeError(
+            "Execution API URL not configured. "
+            "Set AIRFLOW__CORE__EXECUTION_API_SERVER_URL or the "
+            "core.execution_api_server_url Airflow config."
         )
-        try:
-            self._tunnel_context = modal.forward(8080)
-            self._tunnel = self._tunnel_context.__enter__()
-            tunnel_url = self._tunnel.url
-            return self._ensure_execution_prefix(tunnel_url)
-        except Exception as e:
-            raise RuntimeError(
-                f"Execution API URL not configured and tunnel creation failed: {e}. "
-                "Set AIRFLOW__CORE__EXECUTION_API_SERVER_URL or run inside a Modal container."
-            ) from e
 
     def _validate_api_url(self, url: str) -> None:
         """
