@@ -3,28 +3,27 @@
 build:
 	@uv build
 
-# Set up the Sandbox for system tests
-# This builds the package wheel needed by the Sandbox image
+# DAG volume name used by the per-task execution sandboxes.
+DAG_VOLUME_NAME := test-dags-vol
+
+# Set up the Sandbox for system tests (volume-only DAG loading)
+# This builds the package wheel needed by the Sandbox image and pushes the
+# test DAGs to a Modal Volume that the executor mounts into each task sandbox.
+# There is no longer a deploy step or baked-DAG mode.
 system.setup:
 	@echo "Setting up system test Sandbox..."
 	@echo "Building package..."
 	@uv build
 	@chmod 644 dist/*.whl
-	@echo "Deploying modalflow-main (with test DAGs)..."
-	@MODALFLOW_DAGS_DIR=tests/system/dags uv run modal deploy src/modalflow/modal_app.py
+	@echo "Pushing test DAGs to volume '$(DAG_VOLUME_NAME)'..."
+	@uv run modalflow sync --dags-path tests/system/dags --dags-volume $(DAG_VOLUME_NAME)
 	@echo "Setup complete. Run 'make system.test.e2e' to start tests."
 
-# Set up system tests with volume-based DAG loading
-system.setup.volume:
-	@echo "Setting up system test with volume-based DAGs..."
-	@echo "Building package..."
-	@uv build
-	@chmod 644 dist/*.whl
-	@echo "Deploying modalflow-main (volume mode, no baked DAGs)..."
-	@MODALFLOW_DAGS_VOLUME=test-dags-vol uv run modal deploy src/modalflow/modal_app.py
-	@echo "Uploading DAGs to volume..."
-	@uv run modalflow sync --dags-path tests/system/dags --dags-volume test-dags-vol
-	@echo "Setup complete. Run 'make system.test.e2e.volume' to start tests."
+# Set up system tests with volume-based DAG loading.
+# Identical to system.setup (volume-only flow); kept as a separate target so
+# 'make system.test.e2e.volume' has a matching setup entry point.
+system.setup.volume: system.setup
+	@echo "Volume setup complete. Run 'make system.test.e2e.volume' to start tests."
 
 # Run system tests using airflow standalone in Modal Sandbox
 system.test:
