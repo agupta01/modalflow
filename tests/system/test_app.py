@@ -1,8 +1,15 @@
 """
 Modal app for running system tests with airflow standalone in a Sandbox.
 
-This creates a Sandbox that runs airflow standalone to test
-Airflow with the ModalExecutor configured.
+This creates a *control-plane* Sandbox that runs ``airflow standalone`` to test
+Airflow with the ModalExecutor configured.  The control-plane sandbox parses the
+DAGs locally (scheduler + dag-processor) from DAGs baked into ``airflow_test_image``.
+
+Per-task execution happens in separate, on-demand sandboxes created by the
+executor, which mount the test DAGs from a Modal Volume (``test-dags-vol``,
+pushed by ``make system.setup``).  There is no ``modal deploy`` step — the
+control-plane sandbox is told the DAG volume name via ``MODALFLOW_DAGS_VOLUME``
+(see ``environment_variables.env``).
 """
 import sys
 from pathlib import Path
@@ -34,6 +41,9 @@ airflow_test_image = (
     .run_commands(
         f'su -s /bin/bash airflow -c "pip install /tmp/{WHL_NAME}"'
     )
+    # Bake DAGs into the control-plane image so the scheduler/dag-processor can
+    # parse and schedule them.  Per-task execution sandboxes mount the same
+    # DAGs from the test-dags-vol Modal Volume instead (see module docstring).
     .add_local_dir(str(dags_dir), remote_path="/opt/airflow/dags", copy=True)
     .run_commands("chown -R airflow: /opt/airflow")
     .add_local_dir(str(test_dir), remote_path="/files/system")

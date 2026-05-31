@@ -2,10 +2,11 @@
 E2E tests for volume-based DAG loading.
 
 These tests verify that DAGs served from a Modal Volume (rather than
-baked into the function image) work correctly end-to-end.
+baked into a function image) work correctly end-to-end.  Per-task execution
+sandboxes mount the DAGs from the test-dags-vol Modal Volume.
 
 Prerequisites:
-    make system.setup.volume   # deploy with volume mode + upload DAGs
+    make system.setup.volume   # build wheel + push DAGs to test-dags-vol volume
 """
 
 from test_app import create_test_sandbox
